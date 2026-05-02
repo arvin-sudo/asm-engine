@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/arvin-sudo/asm-engine/internal/discovery"
 )
@@ -46,7 +47,13 @@ func main() {
 	// Phase 1a — passive recon via Certificate Transparency logs.
 	// Declared as the SubdomainDiscoverer interface: this code only calls
 	// Discover() and has no access to any CTDiscoverer-specific methods.
-	var subdiscoverer discovery.SubdomainDiscoverer = discovery.NewCTDiscoverer(&http.Client{})
+	// A 30-second timeout prevents the CLI from hanging indefinitely if
+	// crt.sh is slow or unresponsive. Zero timeout (the default) means wait
+	// forever, which gives the user no feedback and no way to recover short
+	// of killing the process.
+	var subdiscoverer discovery.SubdomainDiscoverer = discovery.NewCTDiscoverer(&http.Client{
+		Timeout: 30 * time.Second,
+	})
 
 	subdomains, err := subdiscoverer.Discover(*target)
 	if err != nil {
@@ -61,15 +68,24 @@ func main() {
 
 	var liveCount int
 	for _, s := range subdomains {
-		asset, err := resolver.Discover(s.Name)
-		if err != nil {
-			// A DNS failure does not abort the run. NXDOMAIN is expected for
-			// stale or decommissioned subdomains — those are still worth logging
-			// because they can indicate abandoned infrastructure or shadow IT.
-			fmt.Printf("  [dead]  %s\n", s.Name)
+		// Wildcards (e.g. "*.example.com") are not valid DNS hostnames and
+		// will always produce a resolver error. They are real intelligence —
+		// they prove a wildcard cert was issued — but routing them through
+		// the DNS resolver would misreport them as dead hosts.
+		if s.IsWildcard() {
+			fmt.Printf("  [wildcard]  %s\n", s.Name)
 			continue
 		}
-		fmt.Printf("  [live]  %-40s %v\n", asset.Domain, asset.IPs)
+
+		asset, err := resolver.Discover(s.Name)
+		if err != nil {
+			// NXDOMAIN is expected for stale or decommissioned subdomains.
+			// They are still worth logging as they can indicate abandoned
+			// infrastructure or shadow IT with stale DNS entries.
+			fmt.Printf("  [dead]      %s\n", s.Name)
+			continue
+		}
+		fmt.Printf("  [live]      %-40s %v\n", asset.Domain, asset.IPs)
 		liveCount++
 	}
 

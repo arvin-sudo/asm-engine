@@ -7,6 +7,8 @@
 // pulling in any business logic.
 package models
 
+import "strings"
+
 // Subdomain represents a single hostname discovered during passive recon,
 // before it has been resolved to an IP address.
 //
@@ -32,6 +34,18 @@ type Subdomain struct {
 // should discard invalid values before passing them to the next pipeline stage.
 func (s Subdomain) IsValid() bool {
 	return s.Name != ""
+}
+
+// IsWildcard reports whether this subdomain is a wildcard entry (e.g. "*.example.com").
+//
+// Wildcard hostnames appear in CT logs because TLS wildcard certificates cover
+// all first-level subdomains under a domain. The entry is real intelligence —
+// it proves the organisation issued a wildcard cert — but the name itself is
+// not a valid DNS hostname and cannot be passed to the DNS resolver. Callers
+// use this method to route wildcards to a separate output category instead of
+// letting them fail as spurious DNS errors.
+func (s Subdomain) IsWildcard() bool {
+	return strings.HasPrefix(s.Name, "*.")
 }
 
 // Asset is a fully-resolved external asset: a confirmed hostname together with
