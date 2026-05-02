@@ -103,6 +103,15 @@ func TestCTDiscoverer_Discover(t *testing.T) {
 			wantCount: 2,
 			wantErr:   false,
 		},
+		{
+			name: "mixed-case entries are normalised to lowercase and deduplicated",
+			client: &mockHTTPClient{
+				statusCode: 200,
+				body:       `[{"name_value":"API.example.com"},{"name_value":"api.example.com"}]`,
+			},
+			wantCount: 1,
+			wantErr:   false,
+		},
 	}
 
 	for _, tt := range tests {

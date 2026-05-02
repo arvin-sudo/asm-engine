@@ -43,8 +43,9 @@ type CTDiscoverer struct {
 
 // NewCTDiscoverer constructs a CTDiscoverer backed by the provided HTTP client.
 //
-// Production usage: pass &http.Client{} — it satisfies HTTPClient and uses
-// Go's default transport with connection pooling and keep-alive support.
+// Production usage: pass an *http.Client with a non-zero Timeout. An *http.Client
+// with zero Timeout will wait indefinitely if crt.sh is slow or unresponsive —
+// always set a deadline for outbound network requests in a CLI tool.
 //
 // Test usage: pass a *mockHTTPClient that returns predetermined responses.
 // This is the Dependency Injection pattern: the caller decides which
@@ -145,7 +146,13 @@ func parseSubdomains(entries []crtshEntry, source string) []models.Subdomain {
 
 	for _, e := range entries {
 		for _, name := range strings.Split(e.NameValue, "\n") {
-			name = strings.TrimSpace(name)
+			// Normalize to lowercase before any further processing.
+			// DNS names are case-insensitive (RFC 4343), so "API.example.com"
+			// and "api.example.com" are the same host. Without normalization,
+			// the deduplication map treats them as distinct entries — the DNS
+			// resolver then makes redundant calls and the output lists the same
+			// host twice under different capitalizations.
+			name = strings.ToLower(strings.TrimSpace(name))
 
 			// Skip blank lines that can appear between SANs in malformed entries.
 			if name == "" {

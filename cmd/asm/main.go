@@ -38,6 +38,11 @@ import (
 // Each arrow represents one interface boundary. The concrete types wired
 // together here will grow, but the inner packages will not need to change.
 func main() {
+	// Strip the default date/time prefix from log output. A CLI tool should
+	// print clean error messages — timestamps belong in structured log files,
+	// not in terminal error lines read by a human.
+	log.SetFlags(0)
+
 	target := flag.String("target", "", "target domain to scan (required). Example: --target example.com")
 	flag.Parse()
 
