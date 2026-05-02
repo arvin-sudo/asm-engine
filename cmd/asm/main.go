@@ -16,27 +16,41 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/arvin-sudo/asm-engine/internal/discovery"
+	"github.com/arvin-sudo/asm-engine/internal/fingerprint"
+	"github.com/arvin-sudo/asm-engine/internal/scanner"
+	"github.com/arvin-sudo/asm-engine/pkg/models"
 )
+
+// defaultPorts is the set of TCP ports probed when --ports is not specified.
+//
+// The selection covers services most commonly exposed on an external attack
+// surface: web servers, SSH, database engines, remote desktop, and popular
+// NoSQL stores. This is deliberately narrower than nmap's top-1000 list —
+// the goal is fast, signal-rich output rather than exhaustive enumeration.
+var defaultPorts = []int{
+	21, 22, 23, 25, 53, 80, 110, 143, 443, 445,
+	993, 995, 1433, 3306, 3389, 5432, 6379, 8080, 8443, 8888, 27017,
+}
 
 // main is the CLI entry point.
 //
-// Current pipeline (Phase 1a + 1b):
+// Current pipeline (Phase 1a + 1b + 2):
 //
 //	flag --target
-//	  → CTDiscoverer.Discover   (passive CT log recon, no target contact)
-//	  → DNSResolver.Discover    (resolves each subdomain to live IPs)
+//	  → CTDiscoverer.Discover       (passive CT log recon, no target contact)
+//	  → DNSResolver.Discover        (resolves each subdomain to live IPs)
+//	  → TCPScanner.Scan             (probes open TCP ports with a worker pool)
+//	  → BannerFingerprinter.Fingerprint (reads service banners / HTTP headers)
 //	  → stdout
 //
-// As subsequent phases are implemented, the pipeline will extend naturally:
-//
-//	CTDiscoverer → DNSResolver → TCPScanner → Fingerprinter → Store
-//
-// Each arrow represents one interface boundary. The concrete types wired
-// together here will grow, but the inner packages will not need to change.
+// Phase 3 (cloud bucket hunting) and Phase 4 (PostgreSQL persistence) will
+// extend the pipeline without changing any inner package.
 func main() {
 	// Strip the default date/time prefix from log output. A CLI tool should
 	// print clean error messages — timestamps belong in structured log files,
@@ -44,22 +58,28 @@ func main() {
 	log.SetFlags(0)
 
 	target := flag.String("target", "", "target domain to scan (required). Example: --target example.com")
+	portsFlag := flag.String("ports", "", "comma-separated TCP ports to scan. Default: 21 common ports.")
+	workersFlag := flag.Int("workers", 100, "number of concurrent goroutines for port scanning")
+	timeoutFlag := flag.Duration("scan-timeout", 2*time.Second, "per-connection timeout for port scanning and fingerprinting")
 	flag.Parse()
 
-	// TrimSpace guards against "--target '  '" (whitespace-only) slipping
-	// through the empty-string check and being forwarded to crt.sh.
 	domain := strings.TrimSpace(*target)
 	if domain == "" {
 		log.Fatal("--target is required. Example: asm-engine --target example.com")
 	}
 
+	ports, err := parsePorts(*portsFlag)
+	if err != nil {
+		log.Fatalf("--ports: %v", err)
+	}
+
+	// -------------------------------------------------------------------------
 	// Phase 1a — passive recon via Certificate Transparency logs.
+	// -------------------------------------------------------------------------
 	// Declared as the SubdomainDiscoverer interface: this code only calls
 	// Discover() and has no access to any CTDiscoverer-specific methods.
 	// A 30-second timeout prevents the CLI from hanging indefinitely if
-	// crt.sh is slow or unresponsive. Zero timeout (the default) means wait
-	// forever, which gives the user no feedback and no way to recover short
-	// of killing the process.
+	// crt.sh is slow or unresponsive.
 	var subdiscoverer discovery.SubdomainDiscoverer = discovery.NewCTDiscoverer(&http.Client{
 		Timeout: 30 * time.Second,
 	})
@@ -71,16 +91,19 @@ func main() {
 
 	fmt.Printf("Found %d subdomains for %s\n\n", len(subdomains), domain)
 
+	// -------------------------------------------------------------------------
 	// Phase 1b — DNS resolution of discovered hostnames.
-	// Declared as the Discoverer interface for the same reason as above.
+	// -------------------------------------------------------------------------
 	var resolver discovery.Discoverer = discovery.NewDNSResolver(discovery.NewNetResolver())
 
+	var liveAssets []models.Asset
 	var liveCount, wildcardCount int
+
 	for _, s := range subdomains {
 		// Wildcards (e.g. "*.example.com") are not valid DNS hostnames and
-		// will always produce a resolver error. They are real intelligence —
-		// they prove a wildcard cert was issued — but routing them through
-		// the DNS resolver would misreport them as dead hosts.
+		// will always produce a resolver error. They are still valuable
+		// intelligence — they prove a wildcard certificate was issued — so
+		// they are reported separately rather than silently discarded.
 		if s.IsWildcard() {
 			fmt.Printf("  [wildcard]  %s\n", s.Name)
 			wildcardCount++
@@ -90,15 +113,122 @@ func main() {
 		asset, err := resolver.Discover(s.Name)
 		if err != nil {
 			// NXDOMAIN is expected for stale or decommissioned subdomains.
-			// They are still worth logging as they can indicate abandoned
-			// infrastructure or shadow IT with stale DNS entries.
+			// Dead entries are worth logging: they may indicate abandoned
+			// infrastructure or shadow IT with stale DNS records.
 			fmt.Printf("  [dead]      %s\n", s.Name)
 			continue
 		}
 		fmt.Printf("  [live]      %-40s %s\n", asset.Domain, strings.Join(asset.IPs, ", "))
+		liveAssets = append(liveAssets, asset)
 		liveCount++
 	}
 
 	fmt.Printf("\nResults: %d live, %d wildcard, %d dead — %d total subdomains discovered.\n",
 		liveCount, wildcardCount, len(subdomains)-liveCount-wildcardCount, len(subdomains))
+
+	if len(liveAssets) == 0 {
+		return
+	}
+
+	// -------------------------------------------------------------------------
+	// Phase 2 — TCP port scanning + service fingerprinting.
+	// -------------------------------------------------------------------------
+	// Declared as the Scanner and Fingerprinter interfaces so that Phase 4
+	// tests can inject in-memory doubles without changing this file.
+	fmt.Printf("\nScanning %d port(s) on %d live asset(s) — %d workers, %v timeout...\n\n",
+		len(ports), len(liveAssets), *workersFlag, *timeoutFlag)
+
+	var tcpScanner scanner.Scanner = scanner.NewTCPScanner(ports, *timeoutFlag, *workersFlag)
+
+	// Give fingerprinting one extra second beyond the scan timeout. The scan
+	// timeout only needs to confirm a port is open (one RTT). Fingerprinting
+	// requires a full request-response cycle, so a slightly longer window
+	// avoids false "no banner" results on services with high initial latency.
+	var fingerprinter fingerprint.Fingerprinter = fingerprint.NewBannerFingerprinter(
+		*timeoutFlag+time.Second, 4096,
+	)
+
+	totalOpen := 0
+	for _, asset := range liveAssets {
+		openPorts, err := tcpScanner.Scan(asset)
+		if err != nil {
+			fmt.Printf("  [scan error] %s: %v\n\n", asset.Domain, err)
+			continue
+		}
+		if len(openPorts) == 0 {
+			fmt.Printf("  %s — no open ports found\n\n", asset.Domain)
+			continue
+		}
+
+		// Sort results so output is deterministic regardless of goroutine
+		// scheduling order. Primary key: IP address. Secondary: port number.
+		sort.Slice(openPorts, func(i, j int) bool {
+			if openPorts[i].IP != openPorts[j].IP {
+				return openPorts[i].IP < openPorts[j].IP
+			}
+			return openPorts[i].Number < openPorts[j].Number
+		})
+
+		fmt.Printf("  %s\n", asset.Domain)
+		for _, ip := range asset.IPs {
+			portsForIP := filterByIP(openPorts, ip)
+			if len(portsForIP) == 0 {
+				continue
+			}
+			fmt.Printf("    [%s]\n", ip)
+			for _, p := range portsForIP {
+				totalOpen++
+				svc, err := fingerprinter.Fingerprint(p)
+				if err != nil || svc.Name == "" {
+					// Port is open but we could not identify the service.
+					// Print what we know rather than hiding the finding.
+					fmt.Printf("      %d/tcp   open\n", p.Number)
+					continue
+				}
+				if svc.Version != "" {
+					fmt.Printf("      %d/tcp   %-14s %s\n", p.Number, svc.Name, svc.Version)
+				} else {
+					fmt.Printf("      %d/tcp   %s\n", p.Number, svc.Name)
+				}
+			}
+		}
+		fmt.Println()
+	}
+
+	fmt.Printf("Phase 2 complete: %d open port(s) across %d live asset(s).\n",
+		totalOpen, len(liveAssets))
+}
+
+// parsePorts converts a comma-separated port string to a slice of port numbers.
+// An empty string returns the default port list. Non-integer tokens and
+// out-of-range values (< 1 or > 65535) produce a descriptive error.
+func parsePorts(s string) ([]int, error) {
+	if strings.TrimSpace(s) == "" {
+		return defaultPorts, nil
+	}
+	parts := strings.Split(s, ",")
+	ports := make([]int, 0, len(parts))
+	for _, p := range parts {
+		n, err := strconv.Atoi(strings.TrimSpace(p))
+		if err != nil {
+			return nil, fmt.Errorf("invalid port %q: %v", p, err)
+		}
+		if n < 1 || n > 65535 {
+			return nil, fmt.Errorf("port %d out of range (1–65535)", n)
+		}
+		ports = append(ports, n)
+	}
+	return ports, nil
+}
+
+// filterByIP returns the subset of ports that belong to a specific IP address.
+// Used to group scan results per IP when an asset resolves to multiple addresses.
+func filterByIP(ports []models.Port, ip string) []models.Port {
+	var result []models.Port
+	for _, p := range ports {
+		if p.IP == ip {
+			result = append(result, p)
+		}
+	}
+	return result
 }

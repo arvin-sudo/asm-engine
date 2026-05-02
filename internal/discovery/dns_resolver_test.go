@@ -44,6 +44,12 @@ func TestDNSResolver_Discover(t *testing.T) {
 			wantIPs:  []string{"10.0.0.1"},
 		},
 		{
+			name:     "duplicate IPs from resolver are deduplicated",
+			resolver: &mockResolver{addrs: []string{"1.2.3.4", "5.6.7.8", "1.2.3.4"}},
+			domain:   "multi.example.com",
+			wantIPs:  []string{"1.2.3.4", "5.6.7.8"},
+		},
+		{
 			name:     "NXDOMAIN returns error",
 			resolver: &mockResolver{err: errors.New("no such host")},
 			domain:   "dead.example.com",

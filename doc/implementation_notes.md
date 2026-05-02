@@ -1,0 +1,524 @@
+# ASM Engine — Implementation Notes
+
+**Project:** Automated External Attack Surface Management (ASM)  
+**Author:** Arvin Allahbakhsh  
+**Institution:** Chalmers University of Technology  
+**Company:** Nordic Defender  
+
+---
+
+## Overview
+
+This document describes the technical implementation of the ASM engine, covering every architectural decision made during development — with particular emphasis on **why** each decision was made, not just what was built. It is intended to support the thesis write-up and to provide enough context for anyone reading the source code for the first time.
+
+The engine is written in Go and is structured as a four-stage pipeline:
+
+```
+CT Log Discovery → DNS Resolution → TCP Port Scanning → Service Fingerprinting
+     (Phase 1a)       (Phase 1b)          (Phase 2a)           (Phase 2b)
+```
+
+Each stage is isolated behind an interface. No stage knows how the previous one was implemented or how the next one will use its output. This is what makes the pipeline extensible: Phase 3 (cloud bucket hunting) and Phase 4 (PostgreSQL persistence) can be attached to the pipeline without modifying any existing code.
+
+---
+
+## Repository Layout
+
+```
+asm-engine/
+├── cmd/asm/main.go              CLI entry point — wiring only, no logic
+├── internal/
+│   ├── discovery/
+│   │   ├── discoverer.go        SubdomainDiscoverer + Discoverer interfaces
+│   │   ├── ct_discoverer.go     Phase 1a: queries crt.sh CT logs
+│   │   ├── dns_resolver.go      Phase 1b: resolves hostnames to IPs
+│   │   ├── resolver.go          Resolver interface + net adapter
+│   │   └── http_client.go       HTTPClient interface
+│   ├── scanner/
+│   │   ├── scanner.go           Scanner interface
+│   │   └── tcp_scanner.go       Phase 2a: worker-pool TCP port prober
+│   ├── fingerprint/
+│   │   ├── fingerprinter.go     Fingerprinter interface
+│   │   └── banner_fingerprinter.go  Phase 2b: banner/HTTP service identification
+│   └── storage/
+│       └── store.go             Store interface (Phase 4, not yet implemented)
+└── pkg/models/
+    └── asset.go                 Shared data types: Subdomain, Asset, Port, Service
+```
+
+The `/pkg/models` package is the only package every other package is allowed to import. The `/internal` packages depend only on `/pkg/models` and on each other's interfaces, never on concrete types from sibling packages. `/cmd` is the only place where concrete types are instantiated and wired together. This layering is the structural guarantee that the pipeline stages remain independent.
+
+---
+
+## Core Data Model (`pkg/models`)
+
+Four types flow through the pipeline, each representing a different level of confidence and enrichment.
+
+### `Subdomain`
+
+```go
+type Subdomain struct {
+    Name   string
+    Source string
+}
+```
+
+A hostname discovered by passive recon. At this stage we know the name exists (it appeared in a CT log) but we have not verified whether the host is live or what IP addresses it resolves to. Keeping this separate from `Asset` enforces the distinction between raw intelligence and verified fact — collapsing them would make it impossible to tell which data had been confirmed and which had not.
+
+The `Source` field records which technique found the hostname (e.g. `"ct_log"`). This is forward-looking: Phase 5 benchmarks the output of different discovery sources. Having the source embedded in every record means the analysis query is just a group-by rather than a join.
+
+`IsWildcard()` checks for the `*.` prefix. Wildcards need their own code path because they prove a wildcard TLS certificate was issued — real intelligence — but they are not valid DNS hostnames and cannot be passed to the resolver. Without this method, they would generate spurious NXDOMAIN errors and be misclassified as dead hosts.
+
+### `Asset`
+
+```go
+type Asset struct {
+    Domain string
+    IPs    []string
+}
+```
+
+A confirmed, live host: a hostname plus all IP addresses it currently resolves to. `IPs` is a slice, not a single string, because a hostname behind a load balancer or CDN resolves to multiple addresses. Each IP is an independently reachable point on the attack surface. Storing only the first IP would be a silent data loss.
+
+`Asset` is the input to Phase 2. The port scanner receives the full struct — with all IPs — rather than just a single IP string, because different IPs for the same domain can run different software. Accepting the full `Asset` lets the scanner probe all of them without the caller needing to know how.
+
+### `Port`
+
+```go
+type Port struct {
+    IP     string
+    Number int
+    Proto  string
+}
+```
+
+A single open port on a specific IP address. The `IP` field is essential: without it, two ports with the same number on different IPs of the same asset would be indistinguishable. `Proto` is always `"tcp"` in Phase 2 but the field is there for UDP support in a future phase.
+
+### `Service`
+
+```go
+type Service struct {
+    Port    Port
+    Name    string
+    Version string
+    Banner  string
+}
+```
+
+The enriched output of fingerprinting. `Name` and `Version` are what transform a raw open port into an actionable finding: `"port 443 open"` is noise, `"nginx/1.18.0 — EOL version, known CVEs"` is something a client can act on. `Banner` stores the raw bytes received from the service so that analysts can apply custom detection signatures after the fact without re-scanning.
+
+When fingerprinting is inconclusive, `Name` and `Version` are empty strings and `Banner` holds whatever was received. This is intentional: ambiguity is not a failure. Returning an error for an unidentified service would hide the finding from the output entirely.
+
+---
+
+## Phase 1a — CT Log Discovery (`internal/discovery`)
+
+### Why Certificate Transparency logs?
+
+Every trusted Certificate Authority is required by the CA/Browser Forum to publish issued certificates to public CT logs within 24 hours. This means any subdomain that has ever had a public TLS certificate — including forgotten staging servers, decommissioned APIs, and shadow IT — will appear in a CT log. The organisation itself may not remember these subdomains exist.
+
+crt.sh aggregates hundreds of CT logs and provides a free, unauthenticated API. A single query for `%.example.com` returns every subdomain certificate ever issued for that domain. This gives an attacker's-eye view of the target's historical footprint with no contact with the target at all.
+
+### Interface design
+
+```go
+type SubdomainDiscoverer interface {
+    Discover(domain string) ([]models.Subdomain, error)
+}
+```
+
+The interface is narrow: one method, one responsibility. `CTDiscoverer` satisfies it. A future DNS brute-force module would satisfy it too, with no changes to the interface or to any consumer. This is the Open/Closed principle applied concretely: adding a new discovery source means creating a new struct, not modifying existing ones.
+
+### Implementation decisions
+
+**Streaming JSON decode.** crt.sh returns one JSON array containing every certificate entry. For popular domains this can be thousands of records. The implementation uses `json.NewDecoder(resp.Body).Decode(&entries)` rather than reading the entire body into memory first and then unmarshalling. Streaming keeps peak memory usage flat regardless of response size — relevant when scanning organisations with large certificate histories.
+
+**SAN splitting.** A TLS certificate can secure many domains via Subject Alternative Names. crt.sh packs all the SANs for one certificate into a single `name_value` string, joined by `\n`. If we stored the raw field without splitting, `"*.example.com\nexample.com"` would become one malformed hostname entry instead of two valid, independently actionable ones.
+
+**Deduplication.** The same hostname frequently appears across dozens of certificates — annual renewals, wildcard certs, multi-domain certs. The implementation uses a `map[string]struct{}` as a set to deduplicate before returning results. Without this, the DNS resolver in Phase 1b would make redundant network calls for the same host, multiplying latency unnecessarily.
+
+**Lowercase normalisation.** DNS names are case-insensitive (RFC 4343). `"API.example.com"` and `"api.example.com"` are the same host. Without normalisation, the deduplication map treats them as distinct — the resolver makes redundant calls and the output lists the same host twice with different capitalisation.
+
+**Injected HTTP client.** `CTDiscoverer` accepts an `HTTPClient` interface at construction time rather than creating its own `*http.Client`. This is Dependency Injection: the production binary passes `&http.Client{Timeout: 30*time.Second}`, and tests pass a mock that returns predetermined responses. Neither changes the struct's code.
+
+```go
+type HTTPClient interface {
+    Get(url string) (*http.Response, error)
+}
+```
+
+The interface defines only the method `CTDiscoverer` actually calls. `*http.Client` satisfies it with no adapter needed, because its method signature matches exactly.
+
+---
+
+## Phase 1b — DNS Resolution (`internal/discovery`)
+
+### What this stage does
+
+Phase 1b takes the unverified hostnames from Phase 1a and confirms which ones are currently live by performing A and AAAA lookups. A host that resolves successfully becomes an `Asset` (with its IP addresses) ready for port scanning. A host that returns NXDOMAIN is reported as dead.
+
+Dead hosts are worth reporting, not silently discarding. A subdomain that no longer resolves may still have stale DNS entries elsewhere, forgotten firewall rules, or dangling cloud resources — all real security concerns.
+
+### Interface design
+
+```go
+type Discoverer interface {
+    Discover(domain string) (models.Asset, error)
+}
+```
+
+`DNSResolver` satisfies this interface. `CTDiscoverer` satisfies `SubdomainDiscoverer`. Two different interfaces for two different contracts. They were kept separate because:
+
+1. Their input types differ (`string` returning `[]Subdomain` vs. `string` returning `Asset`).
+2. Their failure semantics differ (CT failure means the data source is down; DNS failure means the host is dead — a normal, meaningful outcome).
+3. Their concurrency futures differ: the CT query is one HTTP call; the DNS resolution loop is the natural point where parallelism would pay off if the subdomain list is large.
+
+### The `Resolver` interface
+
+```go
+type Resolver interface {
+    LookupHost(host string) ([]string, error)
+}
+```
+
+`DNSResolver` depends on this interface rather than directly on `net.LookupHost`. This makes `DNSResolver` testable without a live DNS server: tests inject a `mockResolver` that returns controlled responses. The production path uses `netResolver`, which wraps `net.LookupHost`.
+
+Why not depend on `net.Resolver` directly? `net.Resolver.LookupHost` requires a `context.Context`. Accepting it would force every caller and every test to construct and manage a context before we have any measured reason to need cancellation. The narrow interface defers that decision to the day a timeout problem is actually observed.
+
+---
+
+## Phase 2a — TCP Port Scanning (`internal/scanner`)
+
+### The performance problem this phase solves
+
+Sequential port scanning is the canonical example of where Go's concurrency model delivers measurable value. Consider a realistic scan:
+
+- 50 live assets discovered in Phase 1b
+- 21 ports in the default list
+- 2-second connection timeout per port
+
+**Sequential worst case:** `50 assets × 21 ports × 2 s = 35 minutes`
+
+This worst case is not exotic — it occurs whenever a firewall silently drops packets (a "filtered" port) rather than sending a TCP RST. The dialer holds the connection open for the full timeout before giving up, so every filtered port costs the maximum possible time.
+
+**With 100 concurrent workers:** the same 1 050 probes complete in approximately **2 seconds total** — the timeout of the last batch — because all probes run in parallel.
+
+This is the performance story the thesis is built around: Go's goroutines make a problem that takes 35 minutes sequentially solvable in 2 seconds with a 12-line worker pool. Python would require `asyncio` or `ThreadPoolExecutor` to achieve the same effect; Go's built-in goroutines and channels make it the natural language choice for this workload.
+
+### Interface design
+
+```go
+type Scanner interface {
+    Scan(asset models.Asset) ([]models.Port, error)
+}
+```
+
+`Scan` accepts a full `Asset` rather than a single IP string. An asset can resolve to multiple IP addresses — each is an independent point on the attack surface. Accepting the full struct lets each implementation decide how to handle multiple IPs: probe all of them (the current behaviour), probe only the first, or probe them in parallel. That decision stays inside the implementation without changing the interface.
+
+### Worker pool design
+
+```go
+type TCPScanner struct {
+    ports   []int
+    timeout time.Duration
+    workers int
+}
+```
+
+The pool is implemented with two buffered channels and a `sync.WaitGroup`:
+
+```
+jobs channel ─────────────────────────────────────────────────────►
+                │        │        │        │        │
+            worker 1  worker 2  worker 3  ...  worker N
+                │        │        │        │        │
+results channel ◄─────────────────────────────────────────────────
+```
+
+**Why a fixed-size pool rather than one goroutine per port?**
+
+The naive approach — `go func() { net.DialTimeout(...) }()` for each probe — is unbounded. An asset with five IP addresses and 1 000 ports would spawn 5 000 goroutines simultaneously. Each goroutine that successfully connects consumes a file descriptor; most operating systems cap processes at around 1 024 open descriptors by default (`ulimit -n`). Exceeding this limit causes dials to fail with "too many open files" — not because the ports are closed, but because the local OS ran out of resources.
+
+A fixed-size pool bounds concurrency to a predictable number regardless of how large the port list grows. The 100-worker default means at most 100 simultaneous TCP connections — safely within standard OS limits and consistent with not triggering rate-limiting on the target network.
+
+**Why buffered channels?**
+
+The jobs channel is pre-allocated with capacity `len(IPs) × len(ports)`. This lets the main goroutine enqueue all jobs without blocking — workers start consuming immediately while new jobs are still being added. If the channel were unbuffered, the main goroutine would block on every send until a worker was ready, serialising what should be parallel dispatch.
+
+**The results-close pattern:**
+
+```go
+go func() {
+    wg.Wait()
+    close(results)
+}()
+
+for p := range results {
+    open = append(open, p)
+}
+```
+
+`close(results)` cannot happen in the main goroutine — the main goroutine is blocked draining `results`. It cannot happen inside the workers — any individual worker finishing does not mean all workers are done. It must happen in a third goroutine that waits for the `WaitGroup` to reach zero and then closes the channel. This causes the `for range results` loop to terminate naturally.
+
+**IPv6 correctness:**
+
+All address construction uses `net.JoinHostPort(ip, strconv.Itoa(port))` rather than `fmt.Sprintf("%s:%d", ip, port)`. The difference matters for IPv6: `fmt.Sprintf` produces `"2001:db8::1:80"` — an ambiguous string where the last colon could be part of the address or the port separator. `net.JoinHostPort` produces `"[2001:db8::1]:80"`, which is unambiguous and what the Go dial functions expect.
+
+**What "closed" means:**
+
+A failed dial is not returned as an error. It means the port is closed or filtered — a normal, expected outcome when scanning many ports. Only successful connections produce a `Port` result. The distinction between "refused" (port actively closed, RST sent back) and "timed-out" (port filtered, no response) is invisible to the caller here — both are closed ports from a scan-results perspective.
+
+---
+
+## Phase 2b — Service Fingerprinting (`internal/fingerprint`)
+
+### Why fingerprinting is a separate stage
+
+The scanner and the fingerprinter have fundamentally different connection lifecycles:
+
+- **Scanner:** dial → confirm TCP handshake succeeds → close immediately. No data is read or written. Goal: confirm the port is open. Time per connection: one round-trip.
+- **Fingerprinter:** dial → read/write data to identify the service → close. Goal: identify what software is running. Time per connection: one or more round-trips.
+
+Merging these into one struct would mean the scanner would need to know about SSH banners, HTTP headers, and TLS handshakes. That violates Single Responsibility. More practically, it would make it impossible to scan all ports quickly (the scanner's job) and then fingerprint only the ones that are open (the fingerprinter's job).
+
+### Interface design
+
+```go
+type Fingerprinter interface {
+    Fingerprint(port models.Port) (models.Service, error)
+}
+```
+
+`Fingerprint` accepts a `Port` struct rather than separate IP, number, and protocol arguments. If we later add fields to `Port` (a timeout hint, a scan timestamp), no fingerprinter caller needs to be updated — the method signature is stable.
+
+### Protocol routing
+
+Not all services use the same protocol on first connection. The fingerprinter routes to one of three strategies based on the port number:
+
+```
+Port 443, 8443   →  TLS dial + HTTP HEAD request
+Port 80, 8080, 8888  →  plain dial + HTTP HEAD request
+All others       →  read the first N bytes on connect
+```
+
+**Why HTTP HEAD and not GET?**
+
+HEAD asks for response headers only — the server must not include a body. This is all we need: the `Server:` header is in the response headers. GET would transmit the full response body for every probe, adding unnecessary bandwidth and latency.
+
+**Why HTTP/1.0 and not HTTP/1.1?**
+
+HTTP/1.1 keeps connections alive by default. After sending a response, the server waits for the next request. To know the response is complete under HTTP/1.1, the client must parse `Content-Length` or detect chunked encoding termination. HTTP/1.0 closes the connection after the response, so reading until EOF is sufficient. This simplifies the implementation significantly without affecting the information we need.
+
+**Why `InsecureSkipVerify: true` for HTTPS?**
+
+External scanning targets frequently present TLS certificates that are self-signed, expired, or issued to a different hostname. These are themselves security findings: a certificate error indicates misconfiguration that a real attacker would notice. If we refused to connect on certificate errors, we would hide the underlying service from scan results — the opposite of the goal. The `InsecureSkipVerify` flag is therefore not a security weakness in the scanner; it is a deliberate choice to maximise coverage.
+
+### Banner parsing
+
+Three parsers handle the most common cases.
+
+**SSH** (`SSH-2.0-OpenSSH_8.4p1 Ubuntu-6ubuntu2.1`)
+
+SSH sends its version string immediately on connection, before any client data. The format is defined in RFC 4253:
+
+```
+SSH-<protoversion>-<softwareversion>[ <comments>]\r\n
+```
+
+The software field uses an underscore to separate name from version (`OpenSSH_8.4p1`). A space followed by a comment is optional and is stripped. The result for the example above: `name="openssh"`, `version="8.4p1"`.
+
+**HTTP** (`HTTP/1.x NNN ...\r\nServer: nginx/1.18.0\r\n...`)
+
+The HTTP response headers are scanned line by line for a `Server:` header. The value format is `software/version [comment]`. The comment (e.g. `(Ubuntu)`) is stripped by taking only the first whitespace-delimited token after the version slash. If no `Server:` header is present, `name` is set to `"http"` — the port responded with HTTP but chose not to advertise the server software, which is itself useful to know.
+
+**FTP / SMTP** (`220 ProFTPD 1.3.6 Server ready.`)
+
+Both FTP and SMTP open connections with `220` greetings. The service is identified by keyword-matching against known software names in the banner text (`proftpd`, `vsftpd`, `pure-ftpd`, `postfix`, `sendmail`, `esmtp`). If none match, `name` is left empty rather than guessing — misclassification is worse than no classification.
+
+### Read limit
+
+All banner reads are capped at 4 096 bytes (4 KiB). This is enough to capture any HTTP response header block (which is the most data-rich banner type) while preventing memory exhaustion if a service streams data continuously. A partial read — receiving fewer than 4 096 bytes because the server closed the connection or the deadline fired — is not an error. Whatever bytes arrived are still processed.
+
+---
+
+## Pipeline integration (`cmd/asm/main.go`)
+
+`main.go` is the only file that constructs concrete types. Every other file in the codebase works with interfaces. This means:
+
+- Swapping `CTDiscoverer` for a different discovery source: change one line.
+- Replacing `BannerFingerprinter` with one that uses nmap's service database: change one line.
+- Adding PostgreSQL persistence via `Store`: add two lines (construct the store, call `store.Save(asset)`).
+
+### New CLI flags (Phase 2)
+
+```
+--ports         Comma-separated TCP port list. Default: 21 common ports.
+--workers       Goroutine pool size. Default: 100.
+--scan-timeout  Per-connection deadline. Default: 2s.
+```
+
+The `--ports` flag accepts any comma-separated list of integers in the range 1–65535. Parsing is strict: non-integers and out-of-range values produce a descriptive error before any network activity begins.
+
+The fingerprinter's timeout is set to `scan-timeout + 1 second`. The extra second accounts for the additional round-trip that fingerprinting requires (the scanner only needs to confirm a handshake; the fingerprinter must send a request and receive a response).
+
+### Output structure
+
+Phase 2 output groups results by asset, then by IP:
+
+```
+  api.example.com
+    [1.2.3.4]
+      22/tcp   openssh        8.4p1
+      80/tcp   nginx          1.18.0
+      443/tcp  nginx          1.18.0
+    [5.6.7.8]
+      22/tcp   openssh        8.4p1
+      443/tcp  apache         2.4.41
+```
+
+Open ports are sorted by port number within each IP. Sorting is applied after all worker goroutines have finished, because goroutine scheduling order is non-deterministic — without sorting, the same scan of the same target could produce different output on each run.
+
+When a port is open but fingerprinting fails or returns no service name, the port is still printed as `open` rather than being hidden. A known-open port with an unknown service is still a security finding.
+
+---
+
+## Testing strategy
+
+The test suite uses only the Go standard library — no third-party testing frameworks.
+
+### Table-driven tests
+
+All unit tests use the table-driven pattern:
+
+```go
+tests := []struct {
+    name   string
+    input  string
+    want   string
+}{
+    {"case A", "input-a", "expected-a"},
+    {"case B", "input-b", "expected-b"},
+}
+for _, tt := range tests {
+    t.Run(tt.name, func(t *testing.T) { ... })
+}
+```
+
+This separates the test logic from the test data, making it easy to add new cases without reading or modifying the assertion code.
+
+### Real network listeners instead of mocks
+
+The scanner and fingerprinter tests use `net.Listen("tcp", "127.0.0.1:0")` to bind a real local server on a random port:
+
+```go
+ln, _ := net.Listen("tcp", "127.0.0.1:0")
+port := ln.Addr().(*net.TCPAddr).Port
+```
+
+The `:0` tells the OS to assign an unused port, avoiding conflicts between parallel test runs. This approach exercises the actual `net.DialTimeout` and `net.Conn` code paths through the OS network stack — not a mock that simulates those paths. It gives stronger confidence that the production code path works correctly.
+
+### Error path coverage
+
+Every test file contains at least one test for the error path — an invalid input, a closed port, or an unreachable address. Correct behaviour on the happy path does not guarantee correct behaviour when things go wrong; error paths are where most security tools fail in subtle ways.
+
+### Package-internal test injection
+
+The `BannerFingerprinter` tests are in `package fingerprint` (not `package fingerprint_test`), which gives them access to unexported fields. This allows a test to teach the fingerprinter that a specific local port speaks HTTP:
+
+```go
+f.httpPorts[port] = true
+```
+
+This avoids exporting the field (which would be a leaking internal detail) or adding a constructor overload only used in tests (which would pollute the API).
+
+---
+
+---
+
+## Refactor & Bug-fix Pass (post Phase 2)
+
+A full codebase review was conducted before moving to Phase 3. `go vet` and `-race` came back clean. Three issues were found and fixed.
+
+### Bug fix — double deadline in `BannerFingerprinter`
+
+**The bug:** `probeHTTP` called `conn.SetDeadline(now + timeout)` to bound the entire HTTP request-response cycle. It then called `readBanner`, which called `conn.SetReadDeadline(now + timeout)` *again* — resetting the read deadline to `timeout` measured from after the write finished, not from when the probe started. Result: an HTTP probe could silently take up to `2 × scan-timeout` instead of `scan-timeout`, hiding slow or misbehaving servers rather than timing them out correctly.
+
+**The fix:** `readBanner` is now a pure reader — it does not touch the connection's deadline. Each caller owns its deadline:
+- `grabRawBanner` calls `conn.SetReadDeadline(now + timeout)` after the dial (because `net.DialTimeout` only bounds the dial, not subsequent reads on the established connection).
+- `probeHTTP` calls `conn.SetDeadline(now + timeout)` before writing (one deadline covers both the write and the read, as intended).
+
+The principle: a helper function that reads from a connection should not have hidden side-effects on the connection's state. Deadline management is a caller responsibility.
+
+### Bug fix — missing IP deduplication in `DNSResolver`
+
+**The bug:** `net.LookupHost` can return duplicate addresses in some resolver configurations. Without deduplication, `asset.IPs` could contain the same IP address twice. In `main.go`, the output loop iterates `asset.IPs` once per entry — so a duplicate produces a duplicate output block for the same IP, and the scanner probes that IP twice and reports its ports twice.
+
+**The fix:** `DNSResolver.Discover` now passes the raw IPs through `deduplicateIPs` before building the `Asset`. The helper uses a `map[string]struct{}` set to remove duplicates while preserving the original order returned by the resolver.
+
+Deduplication lives in the resolver, not in the scanner or in `main.go`, because the resolver is where the invariant is established: "an `Asset.IPs` slice contains no duplicates." Enforcing it downstream would mean every consumer that receives an `Asset` has to remember to deduplicate — a leaking implementation detail.
+
+### Missing test coverage — `parsePorts` and `filterByIP`
+
+`parsePorts` is the user-input boundary in `main.go`. It does integer parsing, range validation (1–65535), and whitespace tolerance. All of these paths were untested. A new `cmd/asm/main_test.go` covers:
+- Empty input returns the default port list.
+- Valid comma-separated integers (including boundary values 1 and 65535).
+- Invalid inputs: non-integers, zero, 65536, negative numbers, empty tokens from double-commas.
+- `filterByIP` grouping logic: correct results for a matching IP, a non-matching IP, and an IP not in the list.
+
+User-input handling is a system boundary. Per the project's testing convention, system boundaries must always be covered.
+
+---
+
+---
+
+## Second Refactor Pass (pre Phase 3)
+
+A second full codebase review before moving to Phase 3. `go vet` and `-race` again clean. Four issues found and fixed.
+
+### Improvement — worker pool over-allocation in `TCPScanner`
+
+With `--workers 100` and a small target (1 IP, 3 ports = 3 jobs total), 100 goroutines were started. 97 of them called `range jobs`, saw the already-closed channel, and exited immediately — goroutine initialisation cost with zero benefit. The pool is now capped to `min(s.workers, total)` using the Go builtin introduced in 1.21. For large scans (100 workers, 1 050 jobs) the behaviour is unchanged. For small scans the pool right-sizes itself.
+
+### Refactor — flag variable naming in `main.go`
+
+`portsFlag` had the `Flag` suffix but `workers` and `scanTimeout` did not. All three CLI flag pointer variables are now consistently named: `portsFlag`, `workersFlag`, `timeoutFlag`. Internal consistency in naming is important in code that will be read by academic reviewers.
+
+### Documentation fix — misleading comment in `TestTCPScanner_Scan_MultipleIPs`
+
+The comment said "simulate an asset that resolves to two IPs" but the asset's `IPs` slice contained `"127.0.0.1"` twice — the same address repeated. The test is actually verifying that the scanner does not deduplicate on its own (deduplication is the resolver's responsibility). The comment now accurately describes this: it confirms the scanner probes every `(IP, port)` pair it receives, even duplicates, producing 4 results for 2 ports × 2 IP entries.
+
+### New test — HTTPS fingerprinting path (`grabHTTPSBanner`)
+
+`grabHTTPSBanner` uses `tls.DialWithDialer` with `InsecureSkipVerify: true` — the only non-trivial code path with no test coverage. The test uses `net/http/httptest.NewTLSServer` (standard library), which creates a real TLS listener with a self-signed certificate. Because the fingerprinter intentionally skips certificate verification, the self-signed cert is not a problem — this is the exact same scenario as scanning an external host with a misconfigured or self-signed certificate. The test server responds with `Server: apache/2.4.41` and the fingerprinter correctly extracts name and version.
+
+---
+
+## What comes next
+
+### Phase 3 — Cloud Bucket Hunting
+
+AWS S3, Azure Blob Storage, and Google Cloud Storage buckets are frequently left publicly accessible by misconfiguration. Phase 3 will implement an `HTTPClient`-based prober that constructs well-known bucket URL patterns from the target domain and sends HTTP HEAD requests. An accessible bucket returns `200 OK`; a private one returns `403 Forbidden` or `404 Not Found`. The `HTTPClient` interface already in the codebase is intentionally reused here.
+
+### Phase 4 — PostgreSQL Persistence
+
+The `storage.Store` interface is already defined and ready to implement:
+
+```go
+type Store interface {
+    Save(asset models.Asset) error
+    FindAll() ([]models.Asset, error)
+}
+```
+
+Phase 4 will add a `FirstSeen` and `LastSeen` timestamp to the schema. Running the tool against the same target on different days and comparing `FindAll()` output enables change detection — new subdomains, new open ports, service version changes. This transforms the engine from a point-in-time scanner into a continuous monitoring tool.
+
+### Phase 5 — Go vs Python benchmarking
+
+This is the core academic deliverable. The same pipeline will be implemented in Python using `asyncio` for I/O concurrency. Go's results will be compared against Python's on:
+
+- Total scan time for the same target
+- Peak memory usage
+- Lines of code required to implement equivalent functionality
+- Behavioural correctness under load (correct handling of timeouts, partial reads, concurrent resource limits)
+
+The worker pool in Phase 2a is the primary subject of this comparison. Go's goroutines are lightweight (2–8 KB initial stack vs. a Python thread's 1–8 MB), which means a Go pool of 100 workers uses roughly 1–2 MB of stack memory. A Python equivalent using threads would use significantly more. The benchmark will quantify this difference under controlled conditions.

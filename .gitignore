@@ -1,4 +1,5 @@
 # Compiled binary
+asm
 asm-engine
 *.exe
 *.test

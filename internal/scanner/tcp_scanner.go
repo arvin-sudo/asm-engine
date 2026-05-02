@@ -1,0 +1,137 @@
+package scanner
+
+import (
+	"fmt"
+	"net"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/arvin-sudo/asm-engine/pkg/models"
+)
+
+const (
+	// defaultTimeout is the per-connection dial deadline.
+	//
+	// Two seconds balances speed against false negatives on slow or
+	// geographically distant hosts. A firewall that silently drops packets
+	// (a "filtered" port) will hold the connection open until this deadline
+	// fires, so keeping it short matters when the value is multiplied across
+	// thousands of (IP, port) pairs.
+	defaultTimeout = 2 * time.Second
+
+	// defaultWorkers bounds the goroutine pool size per Scan call.
+	//
+	// 100 concurrent dials is fast in practice while staying within typical
+	// OS file-descriptor limits (ulimit -n is commonly 1 024 or higher). It
+	// also keeps the outbound traffic rate well below the threshold that
+	// network rate-limiting was designed to guard against.
+	defaultWorkers = 100
+)
+
+// TCPScanner implements Scanner by probing a configurable list of TCP ports
+// using a fixed-size goroutine worker pool.
+//
+// Why a fixed-size pool rather than one goroutine per port?
+// Spawning one goroutine per probe is simple but unbounded. An asset with five
+// IP addresses and 1 000 ports would produce 5 000 simultaneous dial attempts.
+// Each consumes a file descriptor; most operating systems cap processes at
+// ~1 024 open descriptors by default. The pool bounds concurrency to a
+// predictable level regardless of how large the port list grows, trading a
+// small amount of throughput for operational safety.
+type TCPScanner struct {
+	ports   []int
+	timeout time.Duration
+	workers int
+}
+
+// NewTCPScanner constructs a TCPScanner.
+//
+// ports is the list of port numbers to probe; callers choose the set relevant
+// to their scan goal. A zero or negative timeout defaults to 2 s; a zero or
+// negative workers count defaults to 100.
+func NewTCPScanner(ports []int, timeout time.Duration, workers int) *TCPScanner {
+	if timeout <= 0 {
+		timeout = defaultTimeout
+	}
+	if workers <= 0 {
+		workers = defaultWorkers
+	}
+	return &TCPScanner{ports: ports, timeout: timeout, workers: workers}
+}
+
+// Scan probes every (IP, port) combination in asset and returns one Port value
+// for each combination that accepted a TCP connection.
+//
+// Work is distributed across s.workers goroutines via a buffered job channel.
+// A successful net.DialTimeout confirms a port is open — the connection is
+// closed immediately because we only need reachability here. Banner reading is
+// the fingerprinter's responsibility and runs in a separate pipeline stage.
+//
+// Results arrive in non-deterministic order because goroutines finish
+// independently. Callers must sort if a stable display order is required.
+func (s *TCPScanner) Scan(asset models.Asset) ([]models.Port, error) {
+	if !asset.IsValid() {
+		return nil, fmt.Errorf("tcp_scanner: invalid asset %q", asset.Domain)
+	}
+
+	type job struct {
+		ip   string
+		port int
+	}
+
+	total := len(asset.IPs) * len(s.ports)
+	jobs := make(chan job, total)
+	results := make(chan models.Port, total)
+
+	// Cap the pool to the actual number of jobs. With a small port list or a
+	// single-IP asset, spawning all s.workers goroutines would mean most of
+	// them start, range over an already-closed jobs channel, and exit without
+	// doing any work — wasted initialisation cost for no benefit.
+	poolSize := min(s.workers, total)
+
+	var wg sync.WaitGroup
+	for range poolSize {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				// net.JoinHostPort handles bare IPv6 addresses correctly —
+				// fmt.Sprintf("%s:%d", ip, port) would produce "::1:80" which
+				// is ambiguous. JoinHostPort produces "[::1]:80" as required.
+				addr := net.JoinHostPort(j.ip, strconv.Itoa(j.port))
+				conn, err := net.DialTimeout("tcp", addr, s.timeout)
+				if err != nil {
+					// A refused or timed-out connection is not an error in the
+					// domain sense — it simply means the port is closed or
+					// filtered. Only open ports produce results.
+					continue
+				}
+				conn.Close()
+				results <- models.Port{IP: j.ip, Number: j.port, Proto: "tcp"}
+			}
+		}()
+	}
+
+	for _, ip := range asset.IPs {
+		for _, port := range s.ports {
+			jobs <- job{ip: ip, port: port}
+		}
+	}
+	close(jobs)
+
+	// Close results only after all workers finish. Running the wait in a
+	// separate goroutine lets the main goroutine drain results concurrently,
+	// which prevents a deadlock when the number of open ports exceeds the
+	// results channel buffer.
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var open []models.Port
+	for p := range results {
+		open = append(open, p)
+	}
+	return open, nil
+}

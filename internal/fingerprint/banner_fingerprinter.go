@@ -1,0 +1,282 @@
+package fingerprint
+
+import (
+	"crypto/tls"
+	"fmt"
+	"net"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/arvin-sudo/asm-engine/pkg/models"
+)
+
+const (
+	// defaultReadLimit caps banner reads at 4 KiB.
+	//
+	// This is enough to capture any HTTP header block or SSH greeting while
+	// preventing memory exhaustion if a service streams data continuously.
+	defaultReadLimit = 4096
+
+	// defaultFingerprintTimeout is the per-connection deadline for both
+	// dialling and reading. Services that send immediate banners (SSH, FTP)
+	// respond in milliseconds; HTTP services need a full request-response
+	// round-trip. Three seconds covers both with headroom for slow hosts.
+	defaultFingerprintTimeout = 3 * time.Second
+)
+
+// BannerFingerprinter implements Fingerprinter by connecting to an open port
+// and reading the service's greeting (its "banner"), or by issuing a minimal
+// HTTP request for web services that wait for the client to speak first.
+//
+// Fingerprinting is deliberately separated from port scanning because the two
+// have different connection lifecycles. The scanner dials and disconnects
+// immediately to confirm reachability. The fingerprinter dials, reads (and
+// sometimes writes), then disconnects to identify the software. Merging them
+// would make the scanner aware of protocol details it must not care about.
+type BannerFingerprinter struct {
+	timeout    time.Duration
+	readLimit  int
+	httpPorts  map[int]bool // ports expected to speak plain HTTP
+	httpsPorts map[int]bool // ports expected to speak HTTPS
+}
+
+// NewBannerFingerprinter constructs a BannerFingerprinter with common HTTP and
+// HTTPS port defaults.
+//
+// timeout is the per-connection deadline; readLimit caps bytes read per banner.
+// Zero or negative values fall back to package defaults.
+func NewBannerFingerprinter(timeout time.Duration, readLimit int) *BannerFingerprinter {
+	if timeout <= 0 {
+		timeout = defaultFingerprintTimeout
+	}
+	if readLimit <= 0 {
+		readLimit = defaultReadLimit
+	}
+	return &BannerFingerprinter{
+		timeout:   timeout,
+		readLimit: readLimit,
+		httpPorts: map[int]bool{
+			80:   true,
+			8080: true,
+			8888: true,
+		},
+		httpsPorts: map[int]bool{
+			443:  true,
+			8443: true,
+		},
+	}
+}
+
+// Fingerprint connects to port and attempts to identify the running service.
+//
+// Strategy selection is based on port number:
+//   - Known HTTPS ports: TLS dial followed by an HTTP HEAD request.
+//   - Known HTTP ports:  plain dial followed by an HTTP HEAD request.
+//   - All other ports:   read whatever bytes the service sends on connection.
+//
+// It always returns a Service. When identification is inconclusive, Name and
+// Version are empty strings and Banner holds the raw bytes received —
+// preserving evidence for manual analysis without treating ambiguity as a
+// failure.
+func (f *BannerFingerprinter) Fingerprint(port models.Port) (models.Service, error) {
+	svc := models.Service{Port: port}
+
+	var (
+		banner string
+		err    error
+	)
+
+	switch {
+	case f.httpsPorts[port.Number]:
+		banner, err = f.grabHTTPSBanner(port)
+	case f.httpPorts[port.Number]:
+		banner, err = f.grabHTTPBanner(port)
+	default:
+		banner, err = f.grabRawBanner(port)
+	}
+
+	if err != nil {
+		return svc, fmt.Errorf("banner_fingerprinter: %s:%d: %w",
+			port.IP, port.Number, err)
+	}
+
+	svc.Banner = banner
+	svc.Name, svc.Version = parseServiceBanner(banner)
+	return svc, nil
+}
+
+// grabRawBanner dials port and reads the first f.readLimit bytes without
+// sending anything. Used for services that emit a greeting on connection
+// (SSH, FTP, SMTP, POP3, IMAP).
+func (f *BannerFingerprinter) grabRawBanner(port models.Port) (string, error) {
+	addr := net.JoinHostPort(port.IP, strconv.Itoa(port.Number))
+	conn, err := net.DialTimeout(port.Proto, addr, f.timeout)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	// net.DialTimeout only bounds the dial, not subsequent reads on the
+	// established connection. Set a read deadline before handing off to
+	// readBanner so a silent server cannot stall the scan indefinitely.
+	if err := conn.SetReadDeadline(time.Now().Add(f.timeout)); err != nil {
+		return "", err
+	}
+	return f.readBanner(conn)
+}
+
+// grabHTTPBanner dials port, sends a minimal HTTP/1.0 HEAD request, and reads
+// the response. HTTP/1.0 is chosen over 1.1 because 1.0 servers close the
+// connection after the response, eliminating the need to parse Content-Length
+// or chunked encoding just to know when to stop reading.
+func (f *BannerFingerprinter) grabHTTPBanner(port models.Port) (string, error) {
+	addr := net.JoinHostPort(port.IP, strconv.Itoa(port.Number))
+	conn, err := net.DialTimeout("tcp", addr, f.timeout)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	return f.probeHTTP(conn, port)
+}
+
+// grabHTTPSBanner dials port over TLS, then follows the same HTTP probe as
+// grabHTTPBanner.
+//
+// InsecureSkipVerify is intentional. External scanning targets frequently
+// present self-signed, expired, or hostname-mismatched certificates — these
+// are themselves security findings. Refusing to connect on certificate errors
+// would hide the underlying service from our results.
+func (f *BannerFingerprinter) grabHTTPSBanner(port models.Port) (string, error) {
+	addr := net.JoinHostPort(port.IP, strconv.Itoa(port.Number))
+	dialer := &net.Dialer{Timeout: f.timeout}
+	conn, err := tls.DialWithDialer(dialer, "tcp", addr,
+		&tls.Config{InsecureSkipVerify: true}) // #nosec G402 — intentional for external recon
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	return f.probeHTTP(conn, port)
+}
+
+// probeHTTP writes a HEAD / HTTP/1.0 request to conn and reads back the
+// response headers. The deadline is set before writing so the entire
+// round-trip is bounded by f.timeout.
+func (f *BannerFingerprinter) probeHTTP(conn net.Conn, port models.Port) (string, error) {
+	if err := conn.SetDeadline(time.Now().Add(f.timeout)); err != nil {
+		return "", err
+	}
+	req := fmt.Sprintf("HEAD / HTTP/1.0\r\nHost: %s\r\n\r\n",
+		net.JoinHostPort(port.IP, strconv.Itoa(port.Number)))
+	if _, err := conn.Write([]byte(req)); err != nil {
+		return "", err
+	}
+	return f.readBanner(conn)
+}
+
+// readBanner reads up to f.readLimit bytes from conn.
+//
+// Callers are responsible for setting a deadline on conn before calling this
+// method — readBanner is a pure reader and does not modify connection state.
+// A partial read (EOF, deadline exceeded) is not an error — whatever bytes
+// arrived are returned as-is, because partial banners still contain useful data.
+func (f *BannerFingerprinter) readBanner(conn net.Conn) (string, error) {
+	buf := make([]byte, f.readLimit)
+	n, _ := conn.Read(buf)
+	return strings.TrimSpace(string(buf[:n])), nil
+}
+
+// parseServiceBanner extracts a service name and version from a raw banner
+// string. Returns empty strings when the banner does not match any known
+// format — ambiguity is not a failure.
+//
+// Recognised patterns:
+//   - SSH:  "SSH-2.0-OpenSSH_8.4p1 Ubuntu-6ubuntu2.1"
+//   - HTTP: "HTTP/1.x NNN ...\r\nServer: nginx/1.18.0\r\n..."
+//   - FTP / SMTP: "220 <software> ..."
+func parseServiceBanner(banner string) (name, version string) {
+	if banner == "" {
+		return
+	}
+
+	switch {
+	case strings.HasPrefix(banner, "SSH-"):
+		return parseSSHBanner(banner)
+	case strings.HasPrefix(banner, "HTTP/"):
+		return parseHTTPBanner(banner)
+	case strings.HasPrefix(banner, "220"):
+		return parseFTPSMTPBanner(banner)
+	}
+	return
+}
+
+// parseSSHBanner extracts name and version from an SSH protocol banner.
+//
+// The SSH wire format is: "SSH-<protoversion>-<softwareversion>[ <comments>]"
+// Example: "SSH-2.0-OpenSSH_8.4p1 Ubuntu-6ubuntu2.1"
+// The software field uses an underscore to separate name from version, so
+// "OpenSSH_8.4p1" becomes name="openssh", version="8.4p1".
+func parseSSHBanner(banner string) (name, version string) {
+	firstLine := strings.TrimRight(strings.SplitN(banner, "\n", 2)[0], "\r")
+	parts := strings.SplitN(firstLine, "-", 3)
+	if len(parts) < 3 {
+		return "ssh", ""
+	}
+
+	// parts[2] = "OpenSSH_8.4p1 Ubuntu-6ubuntu2.1"
+	// Take only the first space-delimited token to drop distro comments.
+	software := strings.Fields(parts[2])
+	if len(software) == 0 {
+		return "ssh", ""
+	}
+
+	sub := strings.SplitN(software[0], "_", 2)
+	name = strings.ToLower(sub[0])
+	if len(sub) > 1 {
+		version = sub[1]
+	}
+	return
+}
+
+// parseHTTPBanner extracts name and version from an HTTP response header block.
+//
+// The Server header format is: "Software/version [comment]"
+// Example: "Server: nginx/1.18.0 (Ubuntu)" → name="nginx", version="1.18.0"
+func parseHTTPBanner(banner string) (name, version string) {
+	for _, line := range strings.Split(banner, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if !strings.HasPrefix(strings.ToLower(line), "server:") {
+			continue
+		}
+		val := strings.TrimSpace(line[len("server:"):])
+		parts := strings.SplitN(val, "/", 2)
+		name = strings.ToLower(strings.TrimSpace(parts[0]))
+		if len(parts) > 1 {
+			// "1.18.0 (Ubuntu)" → take only the version token
+			version = strings.Fields(parts[1])[0]
+		}
+		return
+	}
+	// Response arrived but no Server header — still an HTTP server.
+	name = "http"
+	return
+}
+
+// parseFTPSMTPBanner identifies FTP and SMTP services from their 220 greeting.
+//
+// Both protocols open with "220 <hostname|software> ..." on connection. The
+// distinguishing signal is whether the banner mentions known software keywords.
+func parseFTPSMTPBanner(banner string) (name, version string) {
+	lower := strings.ToLower(banner)
+	switch {
+	case strings.Contains(lower, "ftp"), strings.Contains(lower, "proftpd"),
+		strings.Contains(lower, "vsftpd"), strings.Contains(lower, "pure-ftpd"):
+		name = "ftp"
+	case strings.Contains(lower, "postfix"), strings.Contains(lower, "sendmail"),
+		strings.Contains(lower, "esmtp"), strings.Contains(lower, "smtp"):
+		name = "smtp"
+	default:
+		// 220 is used by several other protocols too; leave name empty
+		// rather than misclassify.
+	}
+	return
+}
