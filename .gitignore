@@ -1,0 +1,15 @@
+# Compiled binary
+asm-engine
+*.exe
+*.test
+*.out
+
+# Environment secrets
+.env
+
+# Vendor directory
+vendor/
+
+# Go workspace file
+go.work
+go.work.sum
