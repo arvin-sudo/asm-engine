@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/arvin-sudo/asm-engine/internal/discovery"
@@ -40,7 +41,10 @@ func main() {
 	target := flag.String("target", "", "target domain to scan (required). Example: --target example.com")
 	flag.Parse()
 
-	if *target == "" {
+	// TrimSpace guards against "--target '  '" (whitespace-only) slipping
+	// through the empty-string check and being forwarded to crt.sh.
+	domain := strings.TrimSpace(*target)
+	if domain == "" {
 		log.Fatal("--target is required. Example: asm-engine --target example.com")
 	}
 
@@ -55,18 +59,18 @@ func main() {
 		Timeout: 30 * time.Second,
 	})
 
-	subdomains, err := subdiscoverer.Discover(*target)
+	subdomains, err := subdiscoverer.Discover(domain)
 	if err != nil {
 		log.Fatalf("CT log discovery failed: %v", err)
 	}
 
-	fmt.Printf("Found %d subdomains for %s\n\n", len(subdomains), *target)
+	fmt.Printf("Found %d subdomains for %s\n\n", len(subdomains), domain)
 
 	// Phase 1b — DNS resolution of discovered hostnames.
 	// Declared as the Discoverer interface for the same reason as above.
 	var resolver discovery.Discoverer = discovery.NewDNSResolver(discovery.NewNetResolver())
 
-	var liveCount int
+	var liveCount, wildcardCount int
 	for _, s := range subdomains {
 		// Wildcards (e.g. "*.example.com") are not valid DNS hostnames and
 		// will always produce a resolver error. They are real intelligence —
@@ -74,6 +78,7 @@ func main() {
 		// the DNS resolver would misreport them as dead hosts.
 		if s.IsWildcard() {
 			fmt.Printf("  [wildcard]  %s\n", s.Name)
+			wildcardCount++
 			continue
 		}
 
@@ -85,9 +90,10 @@ func main() {
 			fmt.Printf("  [dead]      %s\n", s.Name)
 			continue
 		}
-		fmt.Printf("  [live]      %-40s %v\n", asset.Domain, asset.IPs)
+		fmt.Printf("  [live]      %-40s %s\n", asset.Domain, strings.Join(asset.IPs, ", "))
 		liveCount++
 	}
 
-	fmt.Printf("\nResolved %d live assets out of %d subdomains.\n", liveCount, len(subdomains))
+	fmt.Printf("\nResults: %d live, %d wildcard, %d dead — %d total subdomains discovered.\n",
+		liveCount, wildcardCount, len(subdomains)-liveCount-wildcardCount, len(subdomains))
 }

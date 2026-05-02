@@ -4,20 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/arvin-sudo/asm-engine/pkg/models"
 )
 
-// crtshEndpoint is the public crt.sh JSON API for Certificate Transparency queries.
-//
-// How the URL is constructed:
-//   - The %s verb is replaced at runtime with the target domain (e.g. "example.com").
-//   - %25 is the URL-encoded form of %. After fmt.Sprintf, it becomes the literal
-//     string %25, which the browser/HTTP client sends as-is to crt.sh.
-//   - crt.sh interprets %25 as its wildcard operator (%), so the effective query
-//     becomes: find all certificates whose domain matches *.example.com
-//   - &output=json requests a machine-readable response instead of an HTML page.
+// crtshBase is the root URL of the crt.sh Certificate Transparency search API.
 //
 // Why use crt.sh? Certificate Transparency (CT) logs are public, append-only
 // records that every trusted Certificate Authority must publish new TLS
@@ -26,7 +19,7 @@ import (
 // decommissioned APIs, and shadow IT that the organisation itself may not
 // remember. crt.sh aggregates hundreds of CT logs and provides a free,
 // unauthenticated API, making it the ideal first source for passive recon.
-const crtshEndpoint = "https://crt.sh/?q=%%25.%s&output=json"
+const crtshBase = "https://crt.sh/"
 
 // ctLogSource is the label written into every Subdomain found by CTDiscoverer.
 // Using a named constant instead of a raw string literal means there is exactly
@@ -83,7 +76,11 @@ type crtshEntry struct {
 // can immediately identify which layer of the pipeline failed without reading
 // through stack traces.
 func (d *CTDiscoverer) Discover(domain string) ([]models.Subdomain, error) {
-	endpoint := fmt.Sprintf(crtshEndpoint, domain)
+	// The crt.sh wildcard operator is "%", which must be percent-encoded as
+	// "%25" in the query string so the HTTP client transmits it literally.
+	// url.QueryEscape handles this correctly and is far more readable than
+	// embedding the encoding directly in a format string.
+	endpoint := crtshBase + "?q=" + url.QueryEscape("%."+domain) + "&output=json"
 
 	resp, err := d.client.Get(endpoint)
 	if err != nil {
