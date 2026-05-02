@@ -36,12 +36,18 @@ type SubdomainDiscoverer interface {
 // Asset with IP addresses. It is used in Phase 1b, after SubdomainDiscoverer
 // has produced a list of unverified hostnames.
 //
-// Keeping resolution as a separate interface means Phase 1b can resolve
-// hundreds of subdomains concurrently (one goroutine per hostname) without
-// modifying the passive recon code at all. Concurrency is introduced at the
-// boundary between the two interfaces, not inside either one.
+// Keeping resolution as a separate interface means Phase 1b can evolve
+// independently of passive recon. The caller (main.go or a future orchestrator)
+// decides how to iterate over subdomains — sequentially now, with a worker pool
+// in Phase 2 when scanning volume makes the cost measurable. Neither this
+// interface nor its implementations need to change when that decision is made.
 type Discoverer interface {
-	// Discover resolves domain to its current IP addresses and returns it as
-	// a fully-populated Asset. Returns an error if DNS resolution fails entirely.
-	Discover(domain string) ([]models.Asset, error)
+	// Discover resolves domain to its current IP addresses and returns a
+	// fully-populated Asset. Returns an error if DNS resolution fails.
+	//
+	// A single domain maps to exactly one Asset — Asset.IPs already holds
+	// all the addresses the domain resolves to. Returning a slice here would
+	// conflate "multiple IPs for one host" with "multiple hosts", which are
+	// two different concepts at different pipeline stages.
+	Discover(domain string) (models.Asset, error)
 }

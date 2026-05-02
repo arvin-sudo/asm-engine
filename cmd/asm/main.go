@@ -22,13 +22,16 @@ import (
 
 // main is the CLI entry point.
 //
-// Current pipeline (Phase 1a — CT log discovery):
+// Current pipeline (Phase 1a + 1b):
 //
-//	flag --target  →  CTDiscoverer.Discover  →  stdout
+//	flag --target
+//	  → CTDiscoverer.Discover   (passive CT log recon, no target contact)
+//	  → DNSResolver.Discover    (resolves each subdomain to live IPs)
+//	  → stdout
 //
 // As subsequent phases are implemented, the pipeline will extend naturally:
 //
-//	CTDiscoverer  →  DNSDiscoverer  →  TCPScanner  →  Fingerprinter  →  Store
+//	CTDiscoverer → DNSResolver → TCPScanner → Fingerprinter → Store
 //
 // Each arrow represents one interface boundary. The concrete types wired
 // together here will grow, but the inner packages will not need to change.
@@ -40,20 +43,35 @@ func main() {
 		log.Fatal("--target is required. Example: asm-engine --target example.com")
 	}
 
-	// Declare discoverer as the SubdomainDiscoverer interface, not as the
-	// concrete *CTDiscoverer type. This enforces the Dependency Inversion
-	// Principle at the call site: the code below only calls Discover() — it
-	// has no access to any CTDiscoverer-specific methods. If we later swap in
-	// a BruteForceDiscoverer, this line is the only change required.
-	var discoverer discovery.SubdomainDiscoverer = discovery.NewCTDiscoverer(&http.Client{})
+	// Phase 1a — passive recon via Certificate Transparency logs.
+	// Declared as the SubdomainDiscoverer interface: this code only calls
+	// Discover() and has no access to any CTDiscoverer-specific methods.
+	var subdiscoverer discovery.SubdomainDiscoverer = discovery.NewCTDiscoverer(&http.Client{})
 
-	subdomains, err := discoverer.Discover(*target)
+	subdomains, err := subdiscoverer.Discover(*target)
 	if err != nil {
-		log.Fatalf("discovery failed: %v", err)
+		log.Fatalf("CT log discovery failed: %v", err)
 	}
 
 	fmt.Printf("Found %d subdomains for %s\n\n", len(subdomains), *target)
+
+	// Phase 1b — DNS resolution of discovered hostnames.
+	// Declared as the Discoverer interface for the same reason as above.
+	var resolver discovery.Discoverer = discovery.NewDNSResolver(discovery.NewNetResolver())
+
+	var liveCount int
 	for _, s := range subdomains {
-		fmt.Printf("  [%s] %s\n", s.Source, s.Name)
+		asset, err := resolver.Discover(s.Name)
+		if err != nil {
+			// A DNS failure does not abort the run. NXDOMAIN is expected for
+			// stale or decommissioned subdomains — those are still worth logging
+			// because they can indicate abandoned infrastructure or shadow IT.
+			fmt.Printf("  [dead]  %s\n", s.Name)
+			continue
+		}
+		fmt.Printf("  [live]  %-40s %v\n", asset.Domain, asset.IPs)
+		liveCount++
 	}
+
+	fmt.Printf("\nResolved %d live assets out of %d subdomains.\n", liveCount, len(subdomains))
 }
