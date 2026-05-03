@@ -7,7 +7,7 @@ build:
 	go build -o $(BINARY) ./cmd/asm
 
 test:
-	go test -v ./...
+	go test -race -v ./...
 
 run: build
 	./$(BINARY) --target $(TARGET)

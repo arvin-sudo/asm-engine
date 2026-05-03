@@ -230,6 +230,9 @@ func TestBannerFingerprinter_HTTPBanner(t *testing.T) {
 	if svc.Version != "1.18.0" {
 		t.Errorf("Version = %q, want %q", svc.Version, "1.18.0")
 	}
+	if svc.Banner == "" {
+		t.Error("Banner must not be empty — raw HTTP response must be preserved")
+	}
 }
 
 func TestBannerFingerprinter_UnreachablePort(t *testing.T) {
@@ -275,6 +278,46 @@ func TestBannerFingerprinter_HTTPSBanner(t *testing.T) {
 	}
 	if svc.Version != "2.4.41" {
 		t.Errorf("Version = %q, want %q", svc.Version, "2.4.41")
+	}
+	if svc.Banner == "" {
+		t.Error("Banner must not be empty — raw HTTPS response must be preserved")
+	}
+}
+
+func TestBannerFingerprinter_SilentServer(t *testing.T) {
+	// A server that accepts a connection but sends no data before the deadline
+	// fires. The fingerprinter must return nil error with an empty Banner and
+	// empty Name — not a failure. This is the "connected but unidentified" path
+	// that main.go relies on to decide whether to skip storing the service.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		// Accept the connection, write nothing, close immediately. io.ReadAll
+		// returns empty bytes on EOF — same observable result as a server that
+		// holds the connection open until the read deadline fires.
+		conn.Close()
+	}()
+
+	port := ln.Addr().(*net.TCPAddr).Port
+	f := NewBannerFingerprinter(200*time.Millisecond, 256)
+
+	svc, err := f.Fingerprint(models.Port{IP: "127.0.0.1", Number: port, Proto: "tcp"})
+	if err != nil {
+		t.Fatalf("Fingerprint() returned unexpected error = %v", err)
+	}
+	if svc.Banner != "" {
+		t.Errorf("Banner = %q, want empty string for a server that sends nothing", svc.Banner)
+	}
+	if svc.Name != "" {
+		t.Errorf("Name = %q, want empty string for a server that sends nothing", svc.Name)
 	}
 }
 

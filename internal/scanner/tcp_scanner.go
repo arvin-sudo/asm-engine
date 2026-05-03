@@ -81,6 +81,13 @@ func (s *TCPScanner) Scan(asset models.Asset) ([]models.Port, error) {
 	}
 
 	total := len(asset.IPs) * len(s.ports)
+
+	// Nothing to probe — return early rather than creating channels and a
+	// closer goroutine that would immediately terminate for zero work.
+	if total == 0 {
+		return nil, nil
+	}
+
 	jobs := make(chan job, total)
 	results := make(chan models.Port, total)
 

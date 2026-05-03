@@ -32,10 +32,10 @@ A change in one module never breaks another.
 ## Roadmap
 
 - [x] Phase 1a: CT log subdomain discovery (crt.sh)
-- [ ] Phase 1b: DNS resolution of discovered subdomains
-- [ ] Phase 2: TCP port scanning + service fingerprinting
-- [ ] Phase 3: Cloud bucket hunting (S3, Azure Blob)
-- [ ] Phase 4: PostgreSQL persistence with change tracking
+- [x] Phase 1b: DNS resolution of discovered subdomains
+- [x] Phase 2: TCP port scanning + service fingerprinting
+- [x] Phase 3: Cloud bucket hunting (S3, Azure Blob)
+- [x] Phase 4: PostgreSQL persistence with change tracking
 - [ ] Phase 5: Go vs Python performance benchmarking
 
 ## License

@@ -51,7 +51,7 @@ var defaultPorts = []int{
 //	  → TCPScanner.Scan                  (probes open TCP ports with a worker pool)
 //	  → store.SavePort                   (Phase 4: persist each open port)
 //	  → BannerFingerprinter.Fingerprint  (reads service banners / HTTP headers)
-//	  → store.SaveService                (Phase 4: persist identified service)
+//	  → store.SaveService                (Phase 4: persist service when name or banner is present)
 //	  → BucketHunter.Scan               (probes cloud storage URL patterns)
 //	  → store.SaveBucket                 (Phase 4: persist bucket findings)
 //	  → stdout
@@ -173,8 +173,8 @@ func main() {
 	// whether any live assets were found. Port scanning requires a live IP, so
 	// it is skipped when the asset list is empty.
 	if len(liveAssets) > 0 {
-		// Declared as the Scanner and Fingerprinter interfaces so that Phase 4
-		// tests can inject in-memory doubles without changing this file.
+		// Declared as the Scanner and Fingerprinter interfaces so that tests
+		// can inject in-memory doubles without changing this file.
 		fmt.Printf("\nScanning %d port(s) on %d live asset(s) — %d workers, %v timeout...\n\n",
 			len(ports), len(liveAssets), *workersFlag, *timeoutFlag)
 

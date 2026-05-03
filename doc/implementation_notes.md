@@ -875,6 +875,50 @@ The principle: the decision "should we persist this?" and the decision "should w
 
 ---
 
+---
+
+---
+
+## Eighth Refactor Pass (post Phase 4)
+
+A second full codebase review after Phase 4 shipped, covering every file including `go.mod`, `Makefile`, `README.md`, and all test files. `go vet`, `go build`, and `-race` all clean. Seven issues found and fixed.
+
+### Bug fix — `go.mod` marked `lib/pq` as an indirect dependency
+
+**The bug:** `go.mod` contained `require github.com/lib/pq v1.12.3 // indirect`. The `// indirect` annotation means the package is not imported anywhere in the module itself — it is pulled in only because a direct dependency needs it. This was wrong: `internal/storage/postgres_store.go` imports `github.com/lib/pq` directly. A `// indirect` entry communicates a false contract to anyone reading the dependency tree and would cause `go mod tidy` to warn on future runs.
+
+**The fix:** `go mod tidy` removed the annotation, leaving the entry as a plain direct dependency.
+
+### Improvement — `TCPScanner.Scan` spawned a goroutine for zero work
+
+**The observation:** When `total = len(asset.IPs) * len(s.ports) == 0` — which occurs if the asset has no IP addresses or the scanner is constructed with no ports — the code created two channels (capacity zero) and started a "closer" goroutine that called `wg.Wait()` (which returned immediately since no workers were spawned) and closed the results channel. The main goroutine's `for range results` then exited immediately. Correct result, but one goroutine allocation and channel creation for zero actual work.
+
+**The fix:** An early return `if total == 0 { return nil, nil }` placed immediately after the `total` calculation. The zero-job path is now explicit and requires no channel machinery at all. The fix also documents the two reasons this case can arise: an asset with no IPs (rare but valid), and a scanner with no port list (a construction-time misconfiguration that parsePorts already prevents in practice).
+
+### Test gaps — `Banner` field never asserted in HTTP and HTTPS fingerprint tests
+
+**The gap:** `TestBannerFingerprinter_HTTPBanner` and `TestBannerFingerprinter_HTTPSBanner` verified `Name` and `Version` but never checked that `svc.Banner` was populated. The `main.go` banner-persistence fix introduced in the Seventh Refactor Pass relies on `svc.Banner != ""` to decide whether to write an unidentified service to the database. Without asserting the Banner, a regression that accidentally clears it would not be caught.
+
+**The fix:** Both tests now assert `svc.Banner != ""` with a message that explains why the raw response must be preserved.
+
+### New test — `TestBannerFingerprinter_SilentServer`
+
+**The gap:** No test covered the case where a server accepts a TCP connection but sends nothing. This is the path where `io.ReadAll` returns empty bytes (either because the server closes immediately or because the read deadline fires). The expected outcome is: `err == nil`, `svc.Banner == ""`, `svc.Name == ""`. This is the "connected but unidentified" result that `main.go` uses to correctly skip persistence (both Name and Banner empty, nothing to store).
+
+**The fix:** New test that starts a listener, accepts a connection, and immediately closes it without writing. The fingerprinter connects, reads until EOF, and returns a Service with both Banner and Name empty. The test asserts this and directly validates the contract that `main.go`'s persistence guard relies on.
+
+### Documentation fixes
+
+**README.md roadmap:** Only Phase 1a was checked as complete; Phases 1b through 4 are all shipped. Updated all four to `[x]`.
+
+**`cmd/asm/main.go` pipeline doc comment:** The `SaveService` entry still said "persist identified service" after the previous fix changed the behavior to persist unidentified services with raw banners. Updated to "persist service when name or banner is present".
+
+**`cmd/asm/main.go` Phase 2 block comment:** Said "Phase 4 tests can inject in-memory doubles" — an anachronism. Phase 4 is complete. Simplified to "tests can inject in-memory doubles".
+
+**`Makefile` test target:** `go test -v ./...` did not include `-race`. The project's established convention is that `-race` is always required — the testing notes explicitly state: "`-race` is required — not optional." Updated to `go test -race -v ./...`.
+
+---
+
 ## What comes next
 
 ### Phase 5 — Go vs Python benchmarking
