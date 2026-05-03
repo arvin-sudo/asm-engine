@@ -65,7 +65,16 @@ func main() {
 	timeoutFlag := flag.Duration("scan-timeout", 2*time.Second, "per-connection timeout for port scanning and fingerprinting")
 	flag.Parse()
 
-	domain := strings.TrimSpace(*target)
+	// Normalise the domain once at the entry point.
+	// • TrimSpace removes accidental whitespace around the flag value.
+	// • TrimRight removes a trailing dot (FQDN notation: "example.com.").
+	//   Without this, the crt.sh query becomes "%.example.com." and the scope
+	//   filter in parseSubdomains computes target = "example.com.", which never
+	//   matches lowercased results like "api.example.com" — silently returning
+	//   zero subdomains for any target written in FQDN form.
+	// • ToLower avoids case mismatches in the scope filter and bucket-name
+	//   candidates; DNS and crt.sh are both case-insensitive.
+	domain := strings.ToLower(strings.TrimRight(strings.TrimSpace(*target), "."))
 	if domain == "" {
 		log.Fatal("--target is required. Example: asm-engine --target example.com")
 	}
@@ -128,77 +137,78 @@ func main() {
 	fmt.Printf("\nResults: %d live, %d wildcard, %d dead — %d total subdomains discovered.\n",
 		liveCount, wildcardCount, len(subdomains)-liveCount-wildcardCount, len(subdomains))
 
-	if len(liveAssets) == 0 {
-		return
-	}
-
 	// -------------------------------------------------------------------------
 	// Phase 2 — TCP port scanning + service fingerprinting.
 	// -------------------------------------------------------------------------
-	// Declared as the Scanner and Fingerprinter interfaces so that Phase 4
-	// tests can inject in-memory doubles without changing this file.
-	fmt.Printf("\nScanning %d port(s) on %d live asset(s) — %d workers, %v timeout...\n\n",
-		len(ports), len(liveAssets), *workersFlag, *timeoutFlag)
+	// Guarded: bucket hunting (Phase 3) is domain-based and runs regardless of
+	// whether any live assets were found. Port scanning requires a live IP, so
+	// it is skipped when the asset list is empty.
+	if len(liveAssets) > 0 {
+		// Declared as the Scanner and Fingerprinter interfaces so that Phase 4
+		// tests can inject in-memory doubles without changing this file.
+		fmt.Printf("\nScanning %d port(s) on %d live asset(s) — %d workers, %v timeout...\n\n",
+			len(ports), len(liveAssets), *workersFlag, *timeoutFlag)
 
-	var tcpScanner scanner.Scanner = scanner.NewTCPScanner(ports, *timeoutFlag, *workersFlag)
+		var tcpScanner scanner.Scanner = scanner.NewTCPScanner(ports, *timeoutFlag, *workersFlag)
 
-	// Give fingerprinting one extra second beyond the scan timeout. The scan
-	// timeout only needs to confirm a port is open (one RTT). Fingerprinting
-	// requires a full request-response cycle, so a slightly longer window
-	// avoids false "no banner" results on services with high initial latency.
-	var fingerprinter fingerprint.Fingerprinter = fingerprint.NewBannerFingerprinter(
-		*timeoutFlag+time.Second, 4096,
-	)
+		// Give fingerprinting one extra second beyond the scan timeout. The scan
+		// timeout only needs to confirm a port is open (one RTT). Fingerprinting
+		// requires a full request-response cycle, so a slightly longer window
+		// avoids false "no banner" results on services with high initial latency.
+		var fingerprinter fingerprint.Fingerprinter = fingerprint.NewBannerFingerprinter(
+			*timeoutFlag+time.Second, 4096,
+		)
 
-	totalOpen := 0
-	for _, asset := range liveAssets {
-		openPorts, err := tcpScanner.Scan(asset)
-		if err != nil {
-			fmt.Printf("  [scan error] %s: %v\n\n", asset.Domain, err)
-			continue
-		}
-		if len(openPorts) == 0 {
-			fmt.Printf("  %s — no open ports found\n\n", asset.Domain)
-			continue
-		}
-
-		// Sort results so output is deterministic regardless of goroutine
-		// scheduling order. Primary key: IP address. Secondary: port number.
-		sort.Slice(openPorts, func(i, j int) bool {
-			if openPorts[i].IP != openPorts[j].IP {
-				return openPorts[i].IP < openPorts[j].IP
-			}
-			return openPorts[i].Number < openPorts[j].Number
-		})
-
-		fmt.Printf("  %s\n", asset.Domain)
-		for _, ip := range asset.IPs {
-			portsForIP := filterByIP(openPorts, ip)
-			if len(portsForIP) == 0 {
+		totalOpen := 0
+		for _, asset := range liveAssets {
+			openPorts, err := tcpScanner.Scan(asset)
+			if err != nil {
+				fmt.Printf("  [scan error] %s: %v\n\n", asset.Domain, err)
 				continue
 			}
-			fmt.Printf("    [%s]\n", ip)
-			for _, p := range portsForIP {
-				totalOpen++
-				svc, err := fingerprinter.Fingerprint(p)
-				if err != nil || svc.Name == "" {
-					// Port is open but we could not identify the service.
-					// Print what we know rather than hiding the finding.
-					fmt.Printf("      %d/tcp   open\n", p.Number)
+			if len(openPorts) == 0 {
+				fmt.Printf("  %s — no open ports found\n\n", asset.Domain)
+				continue
+			}
+
+			// Sort results so output is deterministic regardless of goroutine
+			// scheduling order. Primary key: IP address. Secondary: port number.
+			sort.Slice(openPorts, func(i, j int) bool {
+				if openPorts[i].IP != openPorts[j].IP {
+					return openPorts[i].IP < openPorts[j].IP
+				}
+				return openPorts[i].Number < openPorts[j].Number
+			})
+
+			fmt.Printf("  %s\n", asset.Domain)
+			for _, ip := range asset.IPs {
+				portsForIP := filterByIP(openPorts, ip)
+				if len(portsForIP) == 0 {
 					continue
 				}
-				if svc.Version != "" {
-					fmt.Printf("      %d/tcp   %-14s %s\n", p.Number, svc.Name, svc.Version)
-				} else {
-					fmt.Printf("      %d/tcp   %s\n", p.Number, svc.Name)
+				fmt.Printf("    [%s]\n", ip)
+				for _, p := range portsForIP {
+					totalOpen++
+					svc, err := fingerprinter.Fingerprint(p)
+					if err != nil || svc.Name == "" {
+						// Port is open but we could not identify the service.
+						// Print what we know rather than hiding the finding.
+						fmt.Printf("      %d/tcp   open\n", p.Number)
+						continue
+					}
+					if svc.Version != "" {
+						fmt.Printf("      %d/tcp   %-14s %s\n", p.Number, svc.Name, svc.Version)
+					} else {
+						fmt.Printf("      %d/tcp   %s\n", p.Number, svc.Name)
+					}
 				}
 			}
+			fmt.Println()
 		}
-		fmt.Println()
-	}
 
-	fmt.Printf("Phase 2 complete: %d open port(s) across %d live asset(s).\n",
-		totalOpen, len(liveAssets))
+		fmt.Printf("Phase 2 complete: %d open port(s) across %d live asset(s).\n",
+			totalOpen, len(liveAssets))
+	}
 
 	// -------------------------------------------------------------------------
 	// Phase 3 — cloud storage bucket hunting.
@@ -237,14 +247,17 @@ func main() {
 	}
 }
 
-// parsePorts converts a comma-separated port string to a slice of port numbers.
-// An empty string returns the default port list. Non-integer tokens and
-// out-of-range values (< 1 or > 65535) produce a descriptive error.
+// parsePorts converts a comma-separated port string to a deduplicated slice of
+// port numbers in input order. An empty string returns the default port list.
+// Non-integer tokens and out-of-range values (< 1 or > 65535) produce a
+// descriptive error. Duplicate port numbers are silently dropped — scanning the
+// same port twice on the same host produces redundant output without any benefit.
 func parsePorts(s string) ([]int, error) {
 	if strings.TrimSpace(s) == "" {
 		return defaultPorts, nil
 	}
 	parts := strings.Split(s, ",")
+	seen := make(map[int]struct{}, len(parts))
 	ports := make([]int, 0, len(parts))
 	for _, p := range parts {
 		n, err := strconv.Atoi(strings.TrimSpace(p))
@@ -254,6 +267,10 @@ func parsePorts(s string) ([]int, error) {
 		if n < 1 || n > 65535 {
 			return nil, fmt.Errorf("port %d out of range (1–65535)", n)
 		}
+		if _, ok := seen[n]; ok {
+			continue
+		}
+		seen[n] = struct{}{}
 		ports = append(ports, n)
 	}
 	return ports, nil

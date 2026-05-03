@@ -80,6 +80,14 @@ func TestParseServiceBanner_HTTP(t *testing.T) {
 			banner:   "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n",
 			wantName: "http",
 		},
+		{
+			// Server: nginx/ — a trailing slash with no version string must not
+			// panic. The name should be extracted; version stays empty.
+			name:        "server header with trailing slash and no version",
+			banner:      "HTTP/1.0 200 OK\r\nServer: nginx/\r\n\r\n",
+			wantName:    "nginx",
+			wantVersion: "",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

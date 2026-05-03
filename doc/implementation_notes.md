@@ -601,6 +601,72 @@ The reason follows the same logic applied to `Asset` and `Service`: Phase 4 (Pos
 
 ---
 
+---
+
+## Fourth Refactor Pass (pre Phase 4)
+
+A full codebase review before moving to Phase 4. `go vet`, `go build`, and `-race` all clean. Five issues found and fixed.
+
+### Bug fix — Phase 3 bucket hunting silently skipped when no live assets found
+
+**The bug:** `main.go` returned early when `len(liveAssets) == 0` — a guard placed before Phase 2 to avoid iterating over an empty slice. The return was positioned before the Phase 3 block too. Cloud bucket hunting (`BucketHunter.Scan`) takes a domain string, not a list of assets — it is completely independent of DNS resolution results. A target with no live subdomains can still have exposed S3 or Azure Blob storage. By returning early, an entire scan category was silently dropped.
+
+**The fix:** Remove the early return. Wrap Phase 2 in `if len(liveAssets) > 0 { }` so the port scanner and fingerprinter are conditionally executed only when there are live assets to scan. Phase 3 sits outside the conditional and runs unconditionally for every target. A comment explains the asymmetry — the guard is not obvious to a reader who does not know that bucket hunting is domain-based.
+
+The principle: an early return is correct when all remaining work is blocked. Here, only one of two remaining phases was blocked.
+
+### Bug fix — `parseSubdomains` included SANs from unrelated domains
+
+**The bug:** A TLS certificate can list many unrelated domains as Subject Alternative Names. A certificate issued for `example.com` might also cover `partner.org` or `vendor.io` in the same multi-domain cert. crt.sh returns all SANs for every certificate that matches `%.example.com`, so `parseSubdomains` could return hostnames like `other.org` that have no connection to the target. The DNS resolver would attempt to resolve them, they could appear in output as findings for the wrong target, and Phase 3 would generate bucket candidates based on them.
+
+**The fix:** `parseSubdomains` now accepts a `targetDomain` parameter. After normalising each SAN to lowercase, it checks `name == target || strings.HasSuffix(name, "."+target)` and discards names that fail. The apex domain itself (`example.com`) and all of its subdomains (`api.example.com`, `*.example.com`) pass the filter; everything else is dropped. Two new test cases cover the filter: one for out-of-scope SANs in the same entry, one confirming the apex domain is kept.
+
+### Improvement — `readBanner` misleading `(string, error)` return type
+
+**The observation:** `readBanner` returned `(string, error)` but the body always returned `nil` for the error. The reason is correct design: `io.ReadAll` on a connection returns an error when the deadline fires (expected — the read window is over) or when the server closes the connection after sending its banner (benign — we already have the bytes). In both cases, the bytes already received are exactly what we want. Propagating those errors would cause callers to discard valid banner data, which is wrong. However, the `(string, error)` signature told callers "this can fail in a meaningful way", and their error checks were dead code.
+
+**The fix:** Change `readBanner` to return just `string`. Each caller — `grabRawBanner` and `probeHTTP` — now returns `f.readBanner(conn), nil` explicitly, making it clear that the error path comes from the dial or write steps, not from banner reading. The doc comment explains the reasoning so a future reader understands why no error is returned.
+
+### Improvement — `grabHTTPBanner` hardcoded `"tcp"` instead of `port.Proto`
+
+**The observation:** `grabHTTPBanner` called `net.DialTimeout("tcp", addr, timeout)` with a hardcoded protocol, while `grabRawBanner` correctly used `port.Proto`. Although HTTP will always run over TCP in practice, the inconsistency could confuse a reader into thinking the two functions handle the `Proto` field differently for a principled reason. It also means that if `Port.Proto` ever carries a different value for protocol-level tunnelling, `grabHTTPBanner` would silently ignore it.
+
+**The fix:** Replace `"tcp"` with `port.Proto` to match `grabRawBanner`'s approach and make the contract explicit: every fingerprinting method uses the transport protocol the scanner recorded.
+
+### Improvement — `parsePorts` did not deduplicate repeated port numbers
+
+**The observation:** `--ports 80,80,443` would scan port 80 twice per host, producing duplicate output lines for the same port. The scanner probes the same `(IP, port)` pair twice, the fingerprinter fingerprints it twice, and the output loop prints it twice — all redundant work.
+
+**The fix:** Add a `map[int]struct{}` deduplication step inside the parsing loop. Ports that have already been added to the result slice are skipped with `continue`. Order is preserved (first occurrence wins). Two new test cases cover a simple duplicate and a case with multiple repeated ports interleaved.
+
+---
+
+---
+
+## Fifth Refactor Pass (pre Phase 4)
+
+A further full codebase review before moving to Phase 4. `go vet`, `go build`, and `-race` all clean. Two bugs and one improvement found and fixed.
+
+### Bug fix — `parseHTTPBanner` panic on empty version after the slash
+
+**The bug:** `parseHTTPBanner` parses a `Server:` header by splitting the value on `/` to separate the software name from its version: `"nginx/1.18.0"` → `["nginx", "1.18.0"]`. It then takes the first whitespace-delimited token from `parts[1]` using `strings.Fields(parts[1])[0]`. If a server emits `Server: nginx/` — a trailing slash with no version string — `parts[1]` is an empty string, `strings.Fields("")` returns an empty slice, and `[][0]` panics with an index-out-of-range error. Any server that sends this malformed-but-legal header would crash the fingerprinter mid-scan, halting Phase 2 entirely for the current asset.
+
+**The fix:** Capture the result of `strings.Fields(parts[1])` in a variable and guard with `if len(fields) > 0` before indexing. When the version field is absent, `name` is still populated from `parts[0]` and `version` stays empty — the fingerprinter correctly reports the software name without a version, the same as for any other service that does not expose its version.
+
+A new test case in `TestParseServiceBanner_HTTP` covers this: `"Server: nginx/"` must produce `name="nginx"`, `version=""` without panicking.
+
+### Bug fix — trailing dot on `--target` silently filters out all discovered subdomains
+
+**The bug:** `main.go` processed the `--target` flag with `strings.TrimSpace` only, leaving a trailing dot if the user supplied FQDN notation (e.g. `--target example.com.`). The domain string with the trailing dot was passed directly to `parseSubdomains` as `targetDomain`. Inside `parseSubdomains`, the scope filter computes `target = "example.com."` and then checks each lowercased SAN against `name != "example.com." && !HasSuffix(name, ".example.com.")`. Since crt.sh returns hostnames without trailing dots (e.g. `api.example.com`), every SAN fails both conditions and is discarded. The result: zero subdomains returned for any target written in FQDN form, with no error message — the pipeline runs but produces no findings.
+
+**The fix:** Normalise the domain at the single entry point in `main()` before it is used anywhere:
+```
+strings.ToLower(strings.TrimRight(strings.TrimSpace(*target), "."))
+```
+`TrimRight` with `"."` strips all trailing dots. `ToLower` ensures the domain is in canonical lowercase before it reaches `parseSubdomains`, `BucketHunter`, and output formatting — eliminating the need for each internal function to independently handle mixed-case input. A comment in `main.go` explains all three operations and why each is necessary.
+
+---
+
 ## What comes next
 
 ### Phase 4 — PostgreSQL Persistence

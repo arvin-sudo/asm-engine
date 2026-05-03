@@ -112,6 +112,40 @@ func TestCTDiscoverer_Discover(t *testing.T) {
 			wantCount: 1,
 			wantErr:   false,
 		},
+		{
+			// A real-world certificate can list SANs for unrelated domains (e.g.
+			// multi-tenant TLS certs). Only names that are the apex or a direct
+			// subdomain of the queried domain should be returned.
+			name: "SANs from unrelated domains are filtered out",
+			client: &mockHTTPClient{
+				statusCode: 200,
+				body:       `[{"name_value":"api.example.com\nunrelated.org\nother.net"}]`,
+			},
+			wantCount: 1, // only api.example.com passes the scope filter
+			wantErr:   false,
+		},
+		{
+			// The apex domain itself can appear as a SAN in its own certificate.
+			name: "apex domain SAN is included",
+			client: &mockHTTPClient{
+				statusCode: 200,
+				body:       `[{"name_value":"example.com\napi.example.com"}]`,
+			},
+			wantCount: 2,
+			wantErr:   false,
+		},
+		{
+			// Mixed-case SANs must be lowercased before the scope filter runs.
+			// "API.EXAMPLE.COM" lowercases to "api.example.com", which is a
+			// subdomain of the target; "other.org" is correctly dropped.
+			name: "mixed-case SANs lowercased before scope filter",
+			client: &mockHTTPClient{
+				statusCode: 200,
+				body:       `[{"name_value":"API.EXAMPLE.COM\nother.org"}]`,
+			},
+			wantCount: 1,
+			wantErr:   false,
+		},
 	}
 
 	for _, tt := range tests {

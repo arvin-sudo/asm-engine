@@ -109,11 +109,12 @@ func (d *CTDiscoverer) Discover(domain string) ([]models.Subdomain, error) {
 		return nil, fmt.Errorf("ct_discoverer: json decode: %w", err)
 	}
 
-	return parseSubdomains(entries, ctLogSource), nil
+	return parseSubdomains(entries, domain, ctLogSource), nil
 }
 
 // parseSubdomains converts raw crt.sh entries into a deduplicated slice of
-// Subdomain values, each tagged with the provided source label.
+// Subdomain values scoped to targetDomain, each tagged with the provided
+// source label.
 //
 // Why split on "\n"?
 // A TLS certificate can secure many domains via Subject Alternative Names
@@ -121,6 +122,14 @@ func (d *CTDiscoverer) Discover(domain string) ([]models.Subdomain, error) {
 // into one name_value string joined by newline characters. Without splitting,
 // "*.example.com\nexample.com" would be stored as a single malformed hostname
 // instead of two valid, independently actionable ones.
+//
+// Why filter by targetDomain?
+// A certificate returned by crt.sh for "%.example.com" can include SANs for
+// entirely unrelated domains (e.g. a multi-tenant cert that covers both
+// "api.example.com" and "other.org"). Without filtering, those unrelated
+// domains leak into the results — the DNS resolver queries them and the output
+// lists them as findings under the wrong target. Only names that equal or are
+// direct subdomains of targetDomain are kept.
 //
 // Why deduplicate?
 // The same hostname frequently appears across dozens of certificates —
@@ -132,7 +141,10 @@ func (d *CTDiscoverer) Discover(domain string) ([]models.Subdomain, error) {
 // parseSubdomains has a single job: parse and deduplicate. Deciding what label
 // to attach belongs to the caller, not to a utility function. This keeps the
 // function reusable for any HTTP-based source without modification.
-func parseSubdomains(entries []crtshEntry, source string) []models.Subdomain {
+func parseSubdomains(entries []crtshEntry, targetDomain, source string) []models.Subdomain {
+	// Normalise once so every comparison is against a consistent baseline.
+	target := strings.ToLower(strings.TrimSpace(targetDomain))
+
 	// seen is used as a set: O(1) average-case lookup to check whether a
 	// hostname has already been added. The empty struct value costs zero bytes,
 	// so the map tracks membership without wasting memory on placeholder values.
@@ -156,6 +168,15 @@ func parseSubdomains(entries []crtshEntry, source string) []models.Subdomain {
 
 			// Skip blank lines that can appear between SANs in malformed entries.
 			if name == "" {
+				continue
+			}
+
+			// Discard SANs that are not part of the target scope. A SAN must
+			// either equal the target apex ("example.com") or be a direct
+			// subdomain of it ("api.example.com", "*.example.com"). Without
+			// this guard, a multi-tenant certificate that covers unrelated
+			// domains would inject those domains into our scan results.
+			if name != target && !strings.HasSuffix(name, "."+target) {
 				continue
 			}
 

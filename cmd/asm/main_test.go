@@ -33,8 +33,10 @@ func TestParsePorts_Valid(t *testing.T) {
 	}{
 		{"80", []int{80}},
 		{"80,443", []int{80, 443}},
-		{"80, 443", []int{80, 443}},   // whitespace around values is trimmed
-		{"1,65535", []int{1, 65535}},  // boundary values are accepted
+		{"80, 443", []int{80, 443}},          // whitespace around values is trimmed
+		{"1,65535", []int{1, 65535}},         // boundary values are accepted
+		{"80,80,443", []int{80, 443}},        // duplicate port is dropped
+		{"80,443,80,8080,443", []int{80, 443, 8080}}, // multiple duplicates, order preserved
 	}
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {

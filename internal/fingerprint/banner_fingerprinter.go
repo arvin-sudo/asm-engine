@@ -123,7 +123,7 @@ func (f *BannerFingerprinter) grabRawBanner(port models.Port) (string, error) {
 	if err := conn.SetReadDeadline(time.Now().Add(f.timeout)); err != nil {
 		return "", err
 	}
-	return f.readBanner(conn)
+	return f.readBanner(conn), nil
 }
 
 // grabHTTPBanner dials port, sends a minimal HTTP/1.0 HEAD request, and reads
@@ -132,7 +132,7 @@ func (f *BannerFingerprinter) grabRawBanner(port models.Port) (string, error) {
 // or chunked encoding just to know when to stop reading.
 func (f *BannerFingerprinter) grabHTTPBanner(port models.Port) (string, error) {
 	addr := net.JoinHostPort(port.IP, strconv.Itoa(port.Number))
-	conn, err := net.DialTimeout("tcp", addr, f.timeout)
+	conn, err := net.DialTimeout(port.Proto, addr, f.timeout)
 	if err != nil {
 		return "", err
 	}
@@ -171,10 +171,11 @@ func (f *BannerFingerprinter) probeHTTP(conn net.Conn, port models.Port) (string
 	if _, err := conn.Write([]byte(req)); err != nil {
 		return "", err
 	}
-	return f.readBanner(conn)
+	return f.readBanner(conn), nil
 }
 
-// readBanner reads up to f.readLimit bytes from conn.
+// readBanner reads up to f.readLimit bytes from conn and returns the result as
+// a trimmed string.
 //
 // Callers are responsible for setting a deadline on conn before calling this
 // method — readBanner is a pure reader and does not modify connection state.
@@ -182,12 +183,17 @@ func (f *BannerFingerprinter) probeHTTP(conn net.Conn, port models.Port) (string
 // io.ReadAll loops until EOF or error, which matters for multi-segment TCP
 // responses (e.g. HTTP headers split across two packets). A single conn.Read
 // would return on the first segment and silently miss any Server: header that
-// arrives in a later one. The deadline fires on the connection when we have
-// waited long enough, causing ReadAll to return whatever arrived — so a partial
-// read is still not treated as an error.
-func (f *BannerFingerprinter) readBanner(conn net.Conn) (string, error) {
+// arrives in a later one. When the connection deadline fires, ReadAll returns
+// whatever bytes arrived — so a partial read is not treated as failure.
+//
+// Why no error return? The only errors io.ReadAll can return here are deadline
+// errors (expected — they signal "read window over") and connection resets
+// (benign — the service closed the connection after sending its banner). In
+// both cases the bytes received so far are the result we want. Propagating
+// these errors would cause callers to discard valid banner data.
+func (f *BannerFingerprinter) readBanner(conn net.Conn) string {
 	data, _ := io.ReadAll(io.LimitReader(conn, int64(f.readLimit)))
-	return strings.TrimSpace(string(data)), nil
+	return strings.TrimSpace(string(data))
 }
 
 // parseServiceBanner extracts a service name and version from a raw banner
@@ -256,8 +262,13 @@ func parseHTTPBanner(banner string) (name, version string) {
 		parts := strings.SplitN(val, "/", 2)
 		name = strings.ToLower(strings.TrimSpace(parts[0]))
 		if len(parts) > 1 {
-			// "1.18.0 (Ubuntu)" → take only the version token
-			version = strings.Fields(parts[1])[0]
+			// "1.18.0 (Ubuntu)" → take only the version token, if present.
+			// Guard against a trailing slash with nothing after it
+			// (e.g. "Server: nginx/"), which would produce an empty fields
+			// slice and panic on [0].
+			if fields := strings.Fields(parts[1]); len(fields) > 0 {
+				version = fields[0]
+			}
 		}
 		return
 	}
