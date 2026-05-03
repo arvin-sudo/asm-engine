@@ -201,9 +201,11 @@ func (f *BannerFingerprinter) readBanner(conn net.Conn) string {
 // format — ambiguity is not a failure.
 //
 // Recognised patterns:
-//   - SSH:  "SSH-2.0-OpenSSH_8.4p1 Ubuntu-6ubuntu2.1"
-//   - HTTP: "HTTP/1.x NNN ...\r\nServer: nginx/1.18.0\r\n..."
+//   - SSH:        "SSH-2.0-OpenSSH_8.4p1 Ubuntu-6ubuntu2.1"
+//   - HTTP:       "HTTP/1.x NNN ...\r\nServer: nginx/1.18.0\r\n..."
 //   - FTP / SMTP: "220 <software> ..."
+//   - POP3:       "+OK Dovecot ready."
+//   - IMAP:       "* OK IMAP4rev1 ..."
 func parseServiceBanner(banner string) (name, version string) {
 	if banner == "" {
 		return
@@ -216,6 +218,10 @@ func parseServiceBanner(banner string) (name, version string) {
 		return parseHTTPBanner(banner)
 	case strings.HasPrefix(banner, "220"):
 		return parseFTPSMTPBanner(banner)
+	case strings.HasPrefix(banner, "+OK"):
+		return parsePOP3Banner(banner)
+	case strings.HasPrefix(banner, "* OK"):
+		return parseIMAPBanner(banner)
 	}
 	return
 }
@@ -275,6 +281,25 @@ func parseHTTPBanner(banner string) (name, version string) {
 	// Response arrived but no Server header — still an HTTP server.
 	name = "http"
 	return
+}
+
+// parsePOP3Banner identifies a POP3 server from its "+OK" greeting.
+//
+// POP3 servers (RFC 1939) always open with "+OK <implementation> ready" or a
+// similar "+OK" line. Version extraction is not attempted — POP3 greetings
+// vary too widely across implementations to parse reliably from the first line.
+func parsePOP3Banner(_ string) (name, version string) {
+	return "pop3", ""
+}
+
+// parseIMAPBanner identifies an IMAP server from its "* OK" untagged greeting.
+//
+// IMAP4rev1 servers (RFC 3501) open with "* OK [CAPABILITY ...] Server ready"
+// or a bare "* OK Server ready". The capability list is embedded in brackets
+// and not consistently formatted, so we identify the service without attempting
+// version extraction.
+func parseIMAPBanner(_ string) (name, version string) {
+	return "imap", ""
 }
 
 // parseFTPSMTPBanner identifies FTP and SMTP services from their 220 greeting.

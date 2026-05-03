@@ -107,6 +107,50 @@ func TestParseServiceBanner_FTP(t *testing.T) {
 	}
 }
 
+func TestParseServiceBanner_POP3(t *testing.T) {
+	tests := []struct {
+		name   string
+		banner string
+	}{
+		{"dovecot greeting", "+OK Dovecot ready."},
+		{"generic +OK greeting", "+OK POP3 server ready <unique@host>"},
+		{"minimal greeting", "+OK"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, version := parseServiceBanner(tt.banner)
+			if got != "pop3" {
+				t.Errorf("parseServiceBanner(%q) = %q, want %q", tt.banner, got, "pop3")
+			}
+			if version != "" {
+				t.Errorf("parseServiceBanner(%q) version = %q, want empty", tt.banner, version)
+			}
+		})
+	}
+}
+
+func TestParseServiceBanner_IMAP(t *testing.T) {
+	tests := []struct {
+		name   string
+		banner string
+	}{
+		{"dovecot with capabilities", "* OK [CAPABILITY IMAP4rev1 LITERAL+ SASL-IR LOGIN-REFERRALS ID ENABLE IDLE AUTH=PLAIN] Dovecot ready."},
+		{"bare ok greeting", "* OK IMAP4rev1 server ready"},
+		{"minimal greeting", "* OK ready"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, version := parseServiceBanner(tt.banner)
+			if got != "imap" {
+				t.Errorf("parseServiceBanner(%q) = %q, want %q", tt.banner, got, "imap")
+			}
+			if version != "" {
+				t.Errorf("parseServiceBanner(%q) version = %q, want empty", tt.banner, version)
+			}
+		})
+	}
+}
+
 func TestParseServiceBanner_SMTP(t *testing.T) {
 	tests := []struct {
 		name   string

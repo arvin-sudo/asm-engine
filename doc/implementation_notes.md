@@ -989,6 +989,57 @@ All new files follow the same interface-injection pattern as existing code. All 
 
 ---
 
+---
+
+---
+
+## Ninth Refactor Pass (pre Phase 5)
+
+A full codebase review covering every file before Phase 5 benchmarking begins. `go vet`, `go build`, and `-race` all clean. No bugs found — eight previous refactor passes left the codebase sound. One UX improvement identified and applied.
+
+### Improvement — Phase 1c and Phase 2 silently skipped when no live assets found
+
+**The observation:** When Phase 1b discovers zero live hosts (all subdomains return NXDOMAIN, or the target has no discoverable subdomains), the pipeline skips Phase 1c (PTR enrichment) and Phase 2 (port scanning) without printing any message. The output jumps directly from the Phase 1b summary to Phase 1d (DNS intelligence), then to Phase 3 (cloud bucket scan). A user running the tool against a target with no live hosts sees no indication that two pipeline stages were intentionally omitted — it looks like those phases simply did not run, which is confusing when debugging a scan that returns fewer results than expected.
+
+**The fix:** Both conditional blocks (`if len(liveAssets) > 0`) now have `else` branches that print a one-line skip message:
+- `"Phase 1c: skipped — no live assets to enrich."`
+- `"Phase 2: skipped — no live assets to scan."`
+
+The messages match the tone and format of the other phase headers, keeping the output consistent across all execution paths.
+
+The principle: every pipeline stage should be accounted for in the output, whether it ran, was skipped, or failed. Silent omissions make the tool harder to use and harder to debug.
+
+---
+
+## Tenth Refactor Pass (pre Phase 5)
+
+Full codebase review before Phase 5 work begins. `go vet`, `go build`, and `-race` all clean after changes. Two correctness fixes and one fingerprinting gap closed.
+
+### Fix 1 — `parseSPF` and `parseMX`: substring matching replaced with suffix/exact matching
+
+**The bug:** Both functions used `strings.Contains(target, pattern)` to match SPF include targets and MX hostnames against known vendor patterns. This produces false positives: `strings.Contains("notmailgun.org", "mailgun.org")` is `true`, so any SPF include containing a vendor name as a substring of an unrelated domain would be misidentified.
+
+**Why substring matching existed:** The intent was to catch legitimate subdomain variants — e.g. `include:eu.mailgun.org` should match the `"mailgun.org"` pattern. `strings.Contains` achieves this but overshoots.
+
+**The fix:** Replace `strings.Contains` with `target == pattern || strings.HasSuffix(target, "."+pattern)`. This correctly handles:
+- Exact match: `include:mailgun.org` → target `"mailgun.org"` == pattern `"mailgun.org"` ✓
+- Subdomain variant: `include:eu.mailgun.org` → `HasSuffix("eu.mailgun.org", ".mailgun.org")` ✓
+- False positive rejected: `include:notmailgun.org` → neither condition is true ✓
+
+The same fix applies to `parseMX` — MX hosts like `aspmx.l.google.com` match `HasSuffix(host, ".google.com")` and are still correctly identified.
+
+All existing tests pass unchanged; the fix is a strict improvement with no regressions.
+
+### Fix 2 — POP3 and IMAP fingerprinting gap
+
+**The gap:** Ports 110 (POP3) and 143 (IMAP) are in `defaultPorts`. The TCP scanner detects them as open, and `grabRawBanner` reads the greeting. However, `parseServiceBanner` had no branch for POP3's `+OK` greeting or IMAP's `* OK` greeting — they fell through to the empty-name default, leaving both services unidentified even though their banners were captured.
+
+**The fix:** Added two cases to the `parseServiceBanner` switch and two parser functions — `parsePOP3Banner` and `parseIMAPBanner`. Both return a service name without a version, because neither protocol's greeting format has a reliable version field across implementations. Three new test cases each cover typical, alternative, and minimal greeting forms.
+
+The change follows the existing SSH / HTTP / FTP-SMTP parser pattern exactly: one `case strings.HasPrefix(banner, ...)` in the switch, one dedicated parsing function, one test table in the test file.
+
+---
+
 ## What comes next
 
 ### Phase 5 — Go vs Python benchmarking

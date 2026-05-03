@@ -133,6 +133,13 @@ func (s *DNSIntelligenceScanner) Scan(domain string) ([]models.ServiceIndicator,
 // The same service name is reported at most once per call even if multiple
 // include: targets match the same provider (e.g. both "google.com" and
 // "_spf.google.com" resolve to "Google Workspace").
+//
+// Why suffix matching instead of strings.Contains?
+// strings.Contains("notmailgun.org", "mailgun.org") is true — a false positive.
+// Suffix matching (target == pattern || HasSuffix(target, "."+pattern)) catches
+// legitimate subdomain variants (e.g. "eu.mailgun.org" matches "mailgun.org")
+// while correctly rejecting unrelated domains that happen to contain the pattern
+// as a substring.
 func parseSPF(txts []string) []models.ServiceIndicator {
 	seen := make(map[string]struct{})
 	var indicators []models.ServiceIndicator
@@ -148,7 +155,7 @@ func parseSPF(txts []string) []models.ServiceIndicator {
 			}
 			target := strings.TrimPrefix(token, "include:")
 			for pattern, service := range spfIncludes {
-				if strings.Contains(target, pattern) {
+				if target == pattern || strings.HasSuffix(target, "."+pattern) {
 					if _, ok := seen[service]; ok {
 						continue
 					}
@@ -168,11 +175,14 @@ func parseSPF(txts []string) []models.ServiceIndicator {
 // parseMX matches MX record hostnames against mxHosts to identify the email
 // provider in use.
 //
-// MX hostnames frequently contain vendor-specific substrings
-// (e.g. "aspmx.l.google.com" → Google Workspace). The same provider is
-// reported at most once even if multiple MX records match the same pattern —
-// a domain may have several MX records for failover, but the provider is the
-// same for all of them.
+// MX hostnames carry vendor-specific subdomain prefixes (e.g. "aspmx.l.google.com"
+// → Google Workspace). The same provider is reported at most once even if multiple
+// MX records match the same pattern — a domain may have several MX records for
+// failover, but the provider is the same for all of them.
+//
+// Matching uses exact equality or suffix containment (host ends with ".pattern")
+// for the same reason as parseSPF: strings.Contains would match false positives
+// where an MX hostname happens to contain a pattern as an unrelated substring.
 func parseMX(mxs []*net.MX) []models.ServiceIndicator {
 	seen := make(map[string]struct{})
 	var indicators []models.ServiceIndicator
@@ -180,7 +190,7 @@ func parseMX(mxs []*net.MX) []models.ServiceIndicator {
 	for _, mx := range mxs {
 		host := strings.ToLower(strings.TrimRight(mx.Host, "."))
 		for pattern, service := range mxHosts {
-			if strings.Contains(host, pattern) {
+			if host == pattern || strings.HasSuffix(host, "."+pattern) {
 				if _, ok := seen[service]; ok {
 					continue
 				}

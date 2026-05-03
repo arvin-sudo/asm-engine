@@ -228,6 +228,8 @@ func main() {
 			}
 		}
 		fmt.Printf("\nPhase 1c complete: %d new asset(s) discovered via PTR.\n", ptrNew)
+	} else {
+		fmt.Printf("\nPhase 1c: skipped — no live assets to enrich.\n")
 	}
 
 	// -------------------------------------------------------------------------
@@ -350,6 +352,8 @@ func main() {
 
 		fmt.Printf("Phase 2 complete: %d open port(s) across %d live asset(s).\n",
 			totalOpen, len(liveAssets))
+	} else {
+		fmt.Printf("\nPhase 2: skipped — no live assets to scan.\n")
 	}
 
 	// -------------------------------------------------------------------------
