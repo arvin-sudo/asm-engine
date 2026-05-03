@@ -227,16 +227,27 @@ func main() {
 						}
 					}
 					svc, err := fingerprinter.Fingerprint(p)
-					if err != nil || svc.Name == "" {
-						// Port is open but we could not identify the service.
-						// Print what we know rather than hiding the finding.
+					if err != nil {
+						// Dial or write failed — port is open but nothing to save or show.
 						fmt.Printf("      %d/tcp   open\n", p.Number)
 						continue
 					}
-					if store != nil {
+					// Persist whenever there is something meaningful to store.
+					// A service with no recognised name may still carry a raw banner
+					// worth preserving for manual analysis — the Fingerprinter contract
+					// guarantees Banner holds whatever bytes arrived, regardless of
+					// whether automated classification succeeded. Only skip saving when
+					// both Name and Banner are empty (the service sent nothing at all).
+					if store != nil && (svc.Name != "" || svc.Banner != "") {
 						if err := store.SaveService(asset.Domain, svc); err != nil {
 							log.Printf("store: save service %s:%d: %v", svc.Port.IP, svc.Port.Number, err)
 						}
+					}
+					if svc.Name == "" {
+						// Port is open and reachable but the service did not produce
+						// enough information to identify it.
+						fmt.Printf("      %d/tcp   open\n", p.Number)
+						continue
 					}
 					if svc.Version != "" {
 						fmt.Printf("      %d/tcp   %-14s %s\n", p.Number, svc.Name, svc.Version)

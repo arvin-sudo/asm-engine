@@ -30,7 +30,9 @@ asm, or attack surface management is one of the biggest defensive aresenals in c
 
 ```
 asm-engine/
-├── cmd/asm/main.go              CLI entry point — wiring only, no logic
+├── cmd/asm/
+│   ├── main.go                  CLI entry point — wiring only, no logic
+│   └── main_test.go             parsePorts + filterByIP unit tests
 ├── internal/
 │   ├── discovery/
 │   │   ├── discoverer.go        SubdomainDiscoverer + Discoverer interfaces
@@ -44,10 +46,15 @@ asm-engine/
 │   ├── fingerprint/
 │   │   ├── fingerprinter.go     Fingerprinter interface
 │   │   └── banner_fingerprinter.go  Phase 2b: banner/HTTP service identification
+│   ├── cloudscan/
+│   │   ├── cloudscan.go         HeadClient + CloudScanner interfaces
+│   │   └── bucket_hunter.go     Phase 3: cloud storage bucket discovery
 │   └── storage/
-│       └── store.go             Store interface (Phase 4, not yet implemented)
+│       ├── store.go             Store interface
+│       └── postgres_store.go    Phase 4: PostgreSQL persistence implementation
 └── pkg/models/
-    └── asset.go                 Shared data types: Subdomain, Asset, Port, Service
+    └── asset.go                 Shared data types: Subdomain, Asset, Port, Service,
+                                 BucketResult, AssetRecord
 ```
 
 The `/pkg/models` package is the only package every other package is allowed to import. The `/internal` packages depend only on `/pkg/models` and on each other's interfaces, never on concrete types from sibling packages. `/cmd` is the only place where concrete types are instantiated and wired together. This layering is the structural guarantee that the pipeline stages remain independent.
@@ -829,6 +836,42 @@ The tests verify:
 - **Upsert preserves `first_seen`:** Calling `SaveAsset` twice with the same domain must advance `last_seen` while leaving `first_seen` unchanged.
 - **Cascade correctness:** `SavePort` and `SaveService` succeed in order; subsequent upserts on the same keys do not error.
 - **Bucket upsert:** Accessibility changes between calls are reflected in the stored row.
+
+---
+
+---
+
+---
+
+## Seventh Refactor Pass (post Phase 4)
+
+A full codebase review after Phase 4 was shipped. `go vet`, `go build`, and `-race` all clean. One bug, two test gaps, and one stale documentation section found and fixed.
+
+### Bug fix — banner data for unidentified services was silently discarded
+
+**The bug:** In `main.go`, the guard before `store.SaveService` was `if err != nil || svc.Name == ""`. Both conditions triggered an immediate `continue`, so they were treated identically. This was wrong: when `err != nil`, fingerprinting failed at the network level (nothing to save), but when `err == nil && svc.Name == ""`, fingerprinting *succeeded* — it dialled, connected, and received a response — but could not classify the service from the banner. In the second case, `svc.Banner` may well be non-empty. That raw banner is exactly what the `Fingerprinter` interface contract promises to preserve:
+
+> "It always returns a Service, even when identification is inconclusive. In that case, Name and Version will be empty strings and Banner will contain whatever raw bytes were received — preserving the evidence for manual analysis without treating ambiguity as a failure."
+
+By collapsing both conditions into one `continue`, `SaveService` was never called for unidentified but banner-bearing services, silently discarding data that analysts would want to inspect.
+
+**The fix:** Split the two conditions. `err != nil` still short-circuits immediately — a failed dial has nothing to save. `svc.Name == ""` no longer blocks persistence; instead, the save guard now checks `svc.Name != "" || svc.Banner != ""`. A service with an empty name but a non-empty banner is written to the database. Only when both are empty (the service accepted a connection but sent no data) is the write skipped — there is nothing useful to store in that case. The stdout output path is unchanged: a port with an unidentified service still prints as `open`.
+
+The principle: the decision "should we persist this?" and the decision "should we print service details?" are independent. Collapsing them into one branch caused one to shadow the other.
+
+### Test gap — `parseFTPSMTPBanner` default branch untested
+
+**The gap:** `parseFTPSMTPBanner` handles three cases: SMTP keywords matched, FTP keywords matched, and a `default:` for any other "220" greeting. The existing tests covered only FTP and SMTP matches. No test verified that a "220" banner with no known keywords returns an empty name, leaving the `default:` branch permanently uncovered.
+
+**The fix:** New test `TestParseServiceBanner_220Unknown` calls `parseServiceBanner("220 CUSTOM-SERVICE-GATEWAY READY")` and asserts both `name` and `version` are empty. The "220" prefix routes to `parseFTPSMTPBanner`, which finds no SMTP or FTP keyword and falls through to the default, confirming the function prefers no classification over a wrong one.
+
+### Test gap — SMTP bare keyword coverage
+
+**The gap:** The existing SMTP test cases both contained `"ESMTP"` in the banner. They verified `strings.Contains(lower, "esmtp")` but left the `"postfix"` and `"smtp"` branches of the switch untested. A regression that accidentally removed those keywords would go undetected.
+
+**The fix:** Two new table-driven cases added to `TestParseServiceBanner_SMTP`:
+- `"220 mail.example.com Postfix"` — exercises the bare `"postfix"` keyword without `"ESMTP"`.
+- `"220 smtp.corp.com ready"` — exercises the bare `"smtp"` keyword.
 
 ---
 

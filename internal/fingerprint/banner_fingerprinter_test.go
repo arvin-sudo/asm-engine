@@ -112,10 +112,13 @@ func TestParseServiceBanner_SMTP(t *testing.T) {
 		name   string
 		banner string
 	}{
-		{"postfix greeting", "220 mail.example.com ESMTP Postfix (2.10.1)"},
+		{"postfix greeting with ESMTP", "220 mail.example.com ESMTP Postfix (2.10.1)"},
 		// "ftp" appears in the hostname but the banner is SMTP — the FTP keyword
 		// must not shadow the SMTP classification.
 		{"smtp banner with ftp in hostname", "220 smtp-ftp-relay.corp.com ESMTP Sendmail"},
+		// Bare keywords (without the ESMTP prefix) must also be recognised.
+		{"bare postfix keyword", "220 mail.example.com Postfix"},
+		{"bare smtp keyword", "220 smtp.corp.com ready"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -124,6 +127,16 @@ func TestParseServiceBanner_SMTP(t *testing.T) {
 				t.Errorf("parseServiceBanner(%q) = %q, want %q", tt.banner, got, "smtp")
 			}
 		})
+	}
+}
+
+func TestParseServiceBanner_220Unknown(t *testing.T) {
+	// A 220 greeting that matches no known SMTP or FTP keywords must leave
+	// name empty rather than misclassify. The default branch of parseFTPSMTPBanner
+	// handles this: "220 is used by several other protocols" — so we return ("", "").
+	name, version := parseServiceBanner("220 CUSTOM-SERVICE-GATEWAY READY")
+	if name != "" || version != "" {
+		t.Errorf("parseServiceBanner(220 unknown) = (%q, %q), want (\"\", \"\")", name, version)
 	}
 }
 
