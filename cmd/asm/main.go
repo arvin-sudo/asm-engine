@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/arvin-sudo/asm-engine/internal/cloudscan"
 	"github.com/arvin-sudo/asm-engine/internal/discovery"
 	"github.com/arvin-sudo/asm-engine/internal/fingerprint"
 	"github.com/arvin-sudo/asm-engine/internal/scanner"
@@ -40,17 +41,18 @@ var defaultPorts = []int{
 
 // main is the CLI entry point.
 //
-// Current pipeline (Phase 1a + 1b + 2):
+// Current pipeline (Phase 1a + 1b + 2 + 3):
 //
 //	flag --target
-//	  → CTDiscoverer.Discover       (passive CT log recon, no target contact)
-//	  → DNSResolver.Discover        (resolves each subdomain to live IPs)
-//	  → TCPScanner.Scan             (probes open TCP ports with a worker pool)
-//	  → BannerFingerprinter.Fingerprint (reads service banners / HTTP headers)
+//	  → CTDiscoverer.Discover            (passive CT log recon, no target contact)
+//	  → DNSResolver.Discover             (resolves each subdomain to live IPs)
+//	  → TCPScanner.Scan                  (probes open TCP ports with a worker pool)
+//	  → BannerFingerprinter.Fingerprint  (reads service banners / HTTP headers)
+//	  → BucketHunter.Scan               (probes cloud storage URL patterns)
 //	  → stdout
 //
-// Phase 3 (cloud bucket hunting) and Phase 4 (PostgreSQL persistence) will
-// extend the pipeline without changing any inner package.
+// Phase 4 (PostgreSQL persistence) will extend the pipeline without changing
+// any inner package.
 func main() {
 	// Strip the default date/time prefix from log output. A CLI tool should
 	// print clean error messages — timestamps belong in structured log files,
@@ -197,6 +199,42 @@ func main() {
 
 	fmt.Printf("Phase 2 complete: %d open port(s) across %d live asset(s).\n",
 		totalOpen, len(liveAssets))
+
+	// -------------------------------------------------------------------------
+	// Phase 3 — cloud storage bucket hunting.
+	// -------------------------------------------------------------------------
+	// A dedicated HTTP client with a longer timeout than the port scanner.
+	// Cloud storage endpoints resolve immediately (they are always available),
+	// but a 10-second window guards against high-latency paths without making
+	// the CLI feel frozen. This client is intentionally separate from the one
+	// used in Phase 1a: that one needs Get; this one needs Head. Sharing a
+	// client would require one of the interfaces to grow a method it never uses.
+	fmt.Printf("\nScanning cloud buckets for %s...\n\n", domain)
+
+	var bucketHunter cloudscan.CloudScanner = cloudscan.NewBucketHunter(&http.Client{
+		Timeout: 10 * time.Second,
+	})
+
+	buckets, err := bucketHunter.Scan(domain)
+	if err != nil {
+		log.Printf("cloud bucket scan failed: %v", err)
+	} else {
+		var publicCount, privateCount int
+		for _, b := range buckets {
+			if b.Accessible {
+				fmt.Printf("  [PUBLIC]   %-60s (%s)\n", b.URL, b.Provider)
+				publicCount++
+			} else {
+				fmt.Printf("  [private]  %-60s (%s)\n", b.URL, b.Provider)
+				privateCount++
+			}
+		}
+		if len(buckets) == 0 {
+			fmt.Println("  No cloud buckets found.")
+		}
+		fmt.Printf("\nPhase 3 complete: %d public, %d private bucket(s) found.\n",
+			publicCount, privateCount)
+	}
 }
 
 // parsePorts converts a comma-separated port string to a slice of port numbers.

@@ -111,3 +111,30 @@ type Service struct {
 	// after the fact, without needing to re-scan the target.
 	Banner string
 }
+
+// BucketResult is a cloud storage bucket probed during Phase 3 (cloud bucket hunting).
+//
+// Why keep this in pkg/models rather than internal/cloudscan? Phase 4
+// (PostgreSQL persistence) needs to store bucket findings alongside asset
+// records. If BucketResult lived inside cloudscan, the storage layer would
+// have to import a business-logic package — violating the dependency rule that
+// says inner layers must not know about outer ones. Placing it here keeps both
+// the scanner and the storage layer independent of each other.
+type BucketResult struct {
+	// URL is the full endpoint that was probed
+	// (e.g. "https://example.s3.amazonaws.com").
+	URL string
+
+	// Provider identifies the cloud platform: "aws_s3" or "azure_blob".
+	Provider string
+
+	// Status is the HTTP status code returned by the HEAD request.
+	// 200 = publicly accessible; 403 = exists but private.
+	Status int
+
+	// Accessible reports whether the bucket responded with 200 OK, meaning
+	// any unauthenticated request can list or read its contents. A 403 means
+	// the bucket exists but requires authentication — still a finding because
+	// it confirms the storage asset is real.
+	Accessible bool
+}

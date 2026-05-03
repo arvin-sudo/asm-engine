@@ -521,11 +521,87 @@ The closer goroutine comment claimed it "prevents a deadlock when the number of 
 
 ---
 
+## Phase 3 — Cloud Bucket Hunting (`internal/cloudscan`)
+
+### Why cloud bucket hunting belongs in an ASM engine
+
+Cloud storage misconfigurations are among the most common and impactful findings in external attack surface assessments. An S3 bucket or Azure Blob container left publicly readable can expose customer data, credentials, source code, and internal documentation — all reachable without authentication by anyone who knows or guesses the URL. Organisations frequently forget these buckets exist: they were created for a one-off project, were never properly tagged, and have been sitting in the account for years.
+
+Bucket hunting is an OSINT technique: it uses only public HTTP endpoints and known naming conventions. There is no contact with the target's own infrastructure. This makes it consistent with the engine's principle of passive, external-only reconnaissance.
+
+### Interface design
+
+```go
+type HeadClient interface {
+    Head(url string) (*http.Response, error)
+}
+
+type CloudScanner interface {
+    Scan(domain string) ([]models.BucketResult, error)
+}
+```
+
+**Why a new `HeadClient` interface rather than reusing `discovery.HTTPClient`?**
+
+`discovery.HTTPClient` exposes only `Get`. Cloud bucket probing only ever needs `Head` — a `GET` would download the bucket's index page (potentially megabytes of XML) for every probe. Adding `Head` to `discovery.HTTPClient` would violate Interface Segregation: every struct in the `discovery` package would then depend on a method none of them call. The two interfaces stay narrow and independent. `*http.Client` satisfies `HeadClient` directly; no adapter is needed.
+
+**Why `CloudScanner.Scan` accepts a domain string rather than a `[]models.Asset`?**
+
+Cloud bucket names are derived from the target organisation's identity (its domain), not from specific live hosts. A bucket called `example-backup` has no relationship to any particular subdomain IP — it exists at the cloud provider's namespace. Accepting the raw domain string is the correct abstraction; passing a resolved asset would conflate two unrelated concepts.
+
+### URL pattern generation
+
+For a target domain like `example.com`, `candidatesFromDomain` derives:
+
+- **Base label**: `example` (leftmost DNS label, which tends to be the organisation slug used in bucket naming)
+- **Suffix variants**: `example-backup`, `example-dev`, `example-staging`, `example-prod`, `example-data`, `example-logs`, `example-assets`, `example-uploads`, `example-static`
+- **Full domain slug**: `example-com` (dots replaced with hyphens — a common convention)
+
+Each candidate is probed at three URL patterns:
+
+| Provider    | URL pattern                                                   | Notes                                                   |
+|-------------|---------------------------------------------------------------|---------------------------------------------------------|
+| AWS S3      | `https://<name>.s3.amazonaws.com`                             | Virtual-hosted style — the primary pattern for modern S3 |
+| AWS S3      | `https://s3.amazonaws.com/<name>`                             | Path style — legacy but still supported                 |
+| Azure Blob  | `https://<name>.blob.core.windows.net/<name>?restype=container` | Container probe — returns 200/403 with clean semantics |
+
+**Why the Azure container URL rather than the account root?**
+
+The Azure Blob account root (`https://<name>.blob.core.windows.net`) returns `400 Bad Request` for existing accounts when no resource type is specified. This would require special-casing `400` alongside `200` and `403` in the status interpretation logic. The container URL (`?restype=container`) returns `200` for public containers and `403` for private ones — the same semantics as S3 — keeping the status interpretation uniform across both providers.
+
+### Status code interpretation
+
+| Status | Meaning         | Reported? | `Accessible` |
+|--------|-----------------|-----------|--------------|
+| 200    | Publicly readable — any unauthenticated request can list or read contents | Yes | `true` |
+| 403    | Exists but private — confirms the storage asset is real even if not immediately exploitable | Yes | `false` |
+| 404    | Not found — bucket name not registered at this provider | No (discarded) | — |
+| Network error | DNS failure, timeout, connection refused | No (skipped) | — |
+
+The 200/403 threshold is deliberately conservative. Treating only confirmed-present buckets as findings avoids false positives from servers that return unexpected status codes on their error pages. A network error skipping a candidate is not treated as "not found" — it means the probe could not reach the endpoint and the result is unknown.
+
+### Sequential probing
+
+Probes run sequentially. With 11 candidates × 3 URL patterns = 33 total HEAD requests, and cloud provider endpoints responding in under 100 ms on a typical connection, the total sweep completes in a few seconds. A concurrent pool would complicate the implementation — adding channel management, a WaitGroup, and a results collector — for a workload that is already fast. The Phase 2 port scanner demonstrated where concurrency delivers a 1 000× speedup; 33 sequential HTTP calls do not present that problem. The worker pool can be added later if profiling shows the candidate set has grown enough to warrant it.
+
+### `BucketResult` in `pkg/models`
+
+`BucketResult` is defined in `pkg/models` rather than `internal/cloudscan`:
+
+```go
+type BucketResult struct {
+    URL        string
+    Provider   string
+    Status     int
+    Accessible bool
+}
+```
+
+The reason follows the same logic applied to `Asset` and `Service`: Phase 4 (PostgreSQL persistence) needs to store bucket findings in the database. If `BucketResult` lived inside `cloudscan`, the storage layer would have to import a business-logic package — violating Clean Architecture's dependency rule that inner layers must not know about outer ones. Placing it in the shared models package keeps both the scanner and the storage layer independent of each other.
+
+---
+
 ## What comes next
-
-### Phase 3 — Cloud Bucket Hunting
-
-AWS S3, Azure Blob Storage, and Google Cloud Storage buckets are frequently left publicly accessible by misconfiguration. Phase 3 will implement an `HTTPClient`-based prober that constructs well-known bucket URL patterns from the target domain and sends HTTP HEAD requests. An accessible bucket returns `200 OK`; a private one returns `403 Forbidden` or `404 Not Found`. The `HTTPClient` interface already in the codebase is intentionally reused here.
 
 ### Phase 4 — PostgreSQL Persistence
 
