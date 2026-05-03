@@ -142,6 +142,27 @@ type BucketResult struct {
 	Accessible bool
 }
 
+// ServiceIndicator represents a third-party service integration discovered from
+// the target domain's DNS records during Phase 1d (DNS intelligence).
+//
+// Third-party services revealed by DNS records represent an indirect attack
+// surface: a compromised Mailgun account can be used to send phishing emails
+// from the target domain, and a misconfigured Zendesk integration can expose
+// internal ticket data. Mapping these integrations is part of understanding
+// the full blast radius of the target's external exposure.
+type ServiceIndicator struct {
+	// Service is the human-readable name of the identified third-party service
+	// (e.g. "Mailgun", "Microsoft 365", "Zendesk").
+	Service string
+
+	// Record is the DNS record type that revealed the integration: "TXT" or "MX".
+	Record string
+
+	// Evidence is the raw DNS record value that matched, preserved for manual
+	// review in case the automatic classification is incorrect or ambiguous.
+	Evidence string
+}
+
 // AssetRecord wraps a fully-resolved Asset with the persistence metadata
 // maintained by the storage layer.
 //

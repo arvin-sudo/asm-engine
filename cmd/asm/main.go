@@ -45,15 +45,17 @@ var defaultPorts = []int{
 // Full pipeline (Phases 1–4):
 //
 //	flag --target
-//	  → CTDiscoverer.Discover            (passive CT log recon, no target contact)
-//	  → DNSResolver.Discover             (resolves each subdomain to live IPs)
-//	  → store.SaveAsset                  (Phase 4: persist live asset, optional)
-//	  → TCPScanner.Scan                  (probes open TCP ports with a worker pool)
-//	  → store.SavePort                   (Phase 4: persist each open port)
-//	  → BannerFingerprinter.Fingerprint  (reads service banners / HTTP headers)
-//	  → store.SaveService                (Phase 4: persist service when name or banner is present)
-//	  → BucketHunter.Scan               (probes cloud storage URL patterns)
-//	  → store.SaveBucket                 (Phase 4: persist bucket findings)
+//	  → MultiSourceDiscoverer.Discover     (Phase 1a: CT logs + HackerTarget + WayBack)
+//	  → DNSResolver.Discover               (Phase 1b: resolve each subdomain to live IPs)
+//	  → PTREnricher.Enrich                 (Phase 1c: reverse DNS enrichment from live IPs)
+//	  → DNSIntelligenceScanner.Scan        (Phase 1d: TXT/MX third-party service indicators)
+//	  → store.SaveAsset                    (Phase 4: persist live asset, optional)
+//	  → TCPScanner.Scan                    (Phase 2: probes open TCP ports with a worker pool)
+//	  → store.SavePort                     (Phase 4: persist each open port)
+//	  → BannerFingerprinter.Fingerprint    (Phase 2: reads service banners / HTTP headers)
+//	  → store.SaveService                  (Phase 4: persist service when name or banner is present)
+//	  → BucketHunter.Scan                  (Phase 3: probes cloud storage URL patterns)
+//	  → store.SaveBucket                   (Phase 4: persist bucket findings)
 //	  → stdout
 //
 // All store calls are guarded by a nil check — when --db is not supplied the
@@ -109,22 +111,31 @@ func main() {
 	}
 
 	// -------------------------------------------------------------------------
-	// Phase 1a — passive recon via Certificate Transparency logs.
+	// Phase 1a — passive recon via multiple OSINT sources.
 	// -------------------------------------------------------------------------
-	// Declared as the SubdomainDiscoverer interface: this code only calls
-	// Discover() and has no access to any CTDiscoverer-specific methods.
-	// A 30-second timeout prevents the CLI from hanging indefinitely if
-	// crt.sh is slow or unresponsive.
-	var subdiscoverer discovery.SubdomainDiscoverer = discovery.NewCTDiscoverer(&http.Client{
-		Timeout: 30 * time.Second,
-	})
+	// MultiSourceDiscoverer fans out to three complementary sources:
+	//   • CTDiscoverer    — Certificate Transparency logs (crt.sh): finds every
+	//     subdomain that has ever had a public TLS certificate.
+	//   • HackerTargetDiscoverer — passive DNS dataset: finds subdomains that
+	//     never had TLS certificates (plain HTTP, internal-only).
+	//   • WayBackDiscoverer — Wayback Machine CDX API: finds historical hostnames
+	//     that no longer have active certificates but may still have live DNS.
+	// Results are merged and deduplicated; the first source that reports a
+	// hostname wins the Source tag for coverage analysis in Phase 5.
+	var subdiscoverer discovery.SubdomainDiscoverer = discovery.NewMultiSourceDiscoverer(
+		discovery.NewCTDiscoverer(&http.Client{Timeout: 30 * time.Second}),
+		discovery.NewHackerTargetDiscoverer(&http.Client{Timeout: 10 * time.Second}),
+		discovery.NewWayBackDiscoverer(&http.Client{Timeout: 60 * time.Second}),
+	)
+
+	fmt.Printf("Phase 1a: passive recon for %s (CT logs, HackerTarget, WayBack)...\n\n", domain)
 
 	subdomains, err := subdiscoverer.Discover(domain)
 	if err != nil {
-		log.Fatalf("CT log discovery failed: %v", err)
+		log.Fatalf("subdomain discovery failed: %v", err)
 	}
 
-	fmt.Printf("Found %d subdomains for %s\n\n", len(subdomains), domain)
+	fmt.Printf("Found %d subdomains.\n\n", len(subdomains))
 
 	// -------------------------------------------------------------------------
 	// Phase 1b — DNS resolution of discovered hostnames.
@@ -163,8 +174,86 @@ func main() {
 	}
 
 	deadCount := len(subdomains) - len(liveAssets) - wildcardCount
-	fmt.Printf("\nResults: %d live, %d wildcard, %d dead — %d total subdomains discovered.\n",
+	fmt.Printf("\nPhase 1b complete: %d live, %d wildcard, %d dead — %d total subdomains discovered.\n",
 		len(liveAssets), wildcardCount, deadCount, len(subdomains))
+
+	// -------------------------------------------------------------------------
+	// Phase 1c — PTR reverse DNS enrichment.
+	// -------------------------------------------------------------------------
+	// After Phase 1b has built the live-asset list, query the PTR records for
+	// every discovered IP. PTR records reveal sibling services on the same cloud
+	// infrastructure — services that never had public TLS certificates (invisible
+	// to CT logs) and were never indexed by HackerTarget or WayBack.
+	if len(liveAssets) > 0 {
+		fmt.Printf("\nPhase 1c: PTR enrichment on discovered IPs...\n\n")
+
+		// Collect every unique IP from all live assets.
+		var allIPs []string
+		for _, a := range liveAssets {
+			allIPs = append(allIPs, a.IPs...)
+		}
+
+		// Build a set of already-known domain names to avoid resolving
+		// PTR hostnames that are already in the live-asset list.
+		knownDomains := make(map[string]struct{}, len(liveAssets))
+		for _, a := range liveAssets {
+			knownDomains[a.Domain] = struct{}{}
+		}
+
+		ptrEnricher := discovery.NewPTREnricher(discovery.NewNetPTRResolver())
+		ptrSubs := ptrEnricher.Enrich(allIPs)
+
+		ptrNew := 0
+		for _, s := range ptrSubs {
+			if _, ok := knownDomains[s.Name]; ok {
+				continue
+			}
+			if s.IsWildcard() {
+				fmt.Printf("  [ptr-wildcard]  %s\n", s.Name)
+				continue
+			}
+			asset, err := resolver.Discover(s.Name)
+			if err != nil {
+				fmt.Printf("  [ptr-dead]      %s\n", s.Name)
+				continue
+			}
+			fmt.Printf("  [ptr-live]      %-40s %s\n", asset.Domain, strings.Join(asset.IPs, ", "))
+			liveAssets = append(liveAssets, asset)
+			knownDomains[asset.Domain] = struct{}{}
+			ptrNew++
+			if store != nil {
+				if err := store.SaveAsset(asset); err != nil {
+					log.Printf("store: save asset %q: %v", asset.Domain, err)
+				}
+			}
+		}
+		fmt.Printf("\nPhase 1c complete: %d new asset(s) discovered via PTR.\n", ptrNew)
+	}
+
+	// -------------------------------------------------------------------------
+	// Phase 1d — DNS intelligence (TXT/MX service indicators).
+	// -------------------------------------------------------------------------
+	// Query the target domain's TXT and MX records to identify third-party
+	// service integrations. These records reveal the indirect attack surface:
+	// SPF includes expose authorised email relays (Mailgun, SendGrid, SES) and
+	// MX records identify the email provider — both are shadow IT indicators
+	// that no amount of subdomain enumeration would otherwise surface.
+	fmt.Printf("\nPhase 1d: DNS intelligence for %s...\n\n", domain)
+
+	intelScanner := discovery.NewDNSIntelligenceScanner(discovery.NewNetDNSIntelResolver())
+	indicators, err := intelScanner.Scan(domain)
+	if err != nil {
+		log.Printf("dns intel scan: %v", err)
+	}
+
+	if len(indicators) == 0 {
+		fmt.Println("  No third-party service indicators found.")
+	} else {
+		for _, ind := range indicators {
+			fmt.Printf("  [%s] %-22s  %s\n", ind.Record, ind.Service, ind.Evidence)
+		}
+	}
+	fmt.Printf("\nPhase 1d complete: %d service indicator(s) found.\n", len(indicators))
 
 	// -------------------------------------------------------------------------
 	// Phase 2 — TCP port scanning + service fingerprinting.
@@ -175,7 +264,7 @@ func main() {
 	if len(liveAssets) > 0 {
 		// Declared as the Scanner and Fingerprinter interfaces so that tests
 		// can inject in-memory doubles without changing this file.
-		fmt.Printf("\nScanning %d port(s) on %d live asset(s) — %d workers, %v timeout...\n\n",
+		fmt.Printf("\nPhase 2: scanning %d port(s) on %d live asset(s) — %d workers, %v timeout...\n\n",
 			len(ports), len(liveAssets), *workersFlag, *timeoutFlag)
 
 		var tcpScanner scanner.Scanner = scanner.NewTCPScanner(ports, *timeoutFlag, *workersFlag)
@@ -272,7 +361,7 @@ func main() {
 	// the CLI feel frozen. This client is intentionally separate from the one
 	// used in Phase 1a: that one needs Get; this one needs Head. Sharing a
 	// client would require one of the interfaces to grow a method it never uses.
-	fmt.Printf("\nScanning cloud buckets for %s...\n\n", domain)
+	fmt.Printf("\nPhase 3: cloud bucket scan for %s...\n\n", domain)
 
 	var bucketHunter cloudscan.CloudScanner = cloudscan.NewBucketHunter(&http.Client{
 		Timeout: 10 * time.Second,

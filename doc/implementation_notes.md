@@ -919,6 +919,76 @@ A second full codebase review after Phase 4 shipped, covering every file includi
 
 ---
 
+## Phase 1 Extension — Multi-Source OSINT (Phases 1a–1d)
+
+**Date:** 2026-05-03
+
+The discovery stage was extended from a single CT log source to a four-step passive recon pipeline.
+
+### Why extend Phase 1a to multiple sources?
+
+A single source has inherent blind spots. Certificate Transparency logs only surface subdomains that have held a public TLS certificate. HackerTarget's passive DNS dataset captures plain-HTTP services and internal-only names that were never issued certificates. The Wayback Machine CDX API covers historical hostnames — subdomains that existed years ago, lost their certificate, but still have a live DNS record pointing at forgotten infrastructure. Using all three sources in parallel maximises coverage and makes the thesis argument for multi-source ASM measurably stronger.
+
+### MultiSourceDiscoverer — the aggregation layer
+
+Rather than adding sequential source calls to `main.go`, a `MultiSourceDiscoverer` encapsulates the fan-out and merge logic. `main.go` sees a single `SubdomainDiscoverer` interface — no knowledge of which concrete sources sit behind it. This follows the same dependency-inversion pattern used throughout the pipeline and keeps the wiring layer free of business logic.
+
+Partial failure policy: if one source fails (e.g. HackerTarget returns 429 because the free-tier quota is exhausted), its results are silently skipped and the remaining sources still contribute. Only a total failure — every source erroring — is propagated to the caller. This mirrors a load balancer: one backend down must not abort the whole request.
+
+The `Subdomain.Source` field records which source first found each hostname. Since deduplication preserves the first occurrence, a hostname found by both CT logs and HackerTarget is tagged `"ct_log"`. This gives Phase 5 clean per-source attribution data for coverage analysis.
+
+### HackerTargetDiscoverer
+
+API: `https://api.hackertarget.com/hostsearch/?q={domain}` — plain-text, one `hostname,ip` pair per line.
+
+Key design decisions:
+- A 429 response is treated as an empty result (not an error). The free-tier daily quota being exhausted is a transient infrastructure limit; aborting the pipeline over it would be wrong when two other sources can still run.
+- Lines without a comma are silently skipped. HackerTarget embeds the error string "API count exceeded" directly in a 200 response body alongside normal data; this guards against that edge case.
+- Source tag: `"hackertarget"`.
+
+### WayBackDiscoverer
+
+API: `https://web.archive.org/cdx/search/cdx?url=*.{domain}&output=json&fl=original&collapse=urlkey&limit=10000`
+
+The CDX API returns a JSON array of string arrays. The first element is always a header row `["original"]`. Subsequent elements are archived URLs from which hostnames are extracted using `net/url.Parse` — this correctly strips ports, paths, and query strings that naive string splitting would mishandle. The `limit=10000` cap keeps response size predictable for popular domains with enormous archive histories.
+
+Source tag: `"wayback"`.
+
+### Phase 1c — PTR Reverse DNS Enrichment
+
+After Phase 1b has resolved subdomains to IP addresses, a `PTREnricher` queries `net.LookupAddr` on every discovered IP. PTR records reveal sibling services on the same cloud infrastructure — services that never had public TLS certificates and were never indexed by any passive source.
+
+A new `PTRResolver` interface (separate from the existing `Resolver`) follows Interface Segregation: `PTREnricher` only ever needs `LookupAddr`, and `DNSResolver` only ever needs `LookupHost`. Merging them would force every mock to stub a method it never uses.
+
+Returned hostnames with a trailing FQDN dot (Go's `net.LookupAddr` convention) are trimmed before being passed to the DNS resolver. Each unique IP is queried at most once; the same hostname returned by multiple IPs is deduplicated. Source tag: `"ptr"`.
+
+### Phase 1d — DNS Intelligence (TXT/MX service indicators)
+
+The `DNSIntelligenceScanner` queries TXT and MX records for the target apex domain and extracts `ServiceIndicator` values for recognised third-party integrations.
+
+**Why this matters for ASM:** SPF records expose every email and identity service the organisation has authorised (`include:mailgun.org`, `include:_spf.google.com`, etc.). These represent shadow IT — integrations added by individual teams that may not have undergone a security review. MX records identify the email provider, which is relevant for phishing risk assessment. Together they reveal an indirect attack surface that no amount of subdomain enumeration can surface.
+
+Pattern matching uses substring containment against `spfIncludes` and `mxHosts` maps. A provider matched by multiple patterns in the same record (e.g. both `_spf.google.com` and `google.com` matching "Google Workspace") is reported once per record type. The same provider can appear as both a TXT indicator and an MX indicator — these are distinct findings with different evidence.
+
+The `ServiceIndicator` type lives in `pkg/models` rather than `internal/discovery` because future persistence of these findings would require the storage layer to import the type. Placing it in `pkg/models` keeps all layers independent.
+
+The `DNSIntelResolver` interface covers `LookupTXT` and `LookupMX` in a single interface because they are always queried together in a single scan and splitting them would provide no practical benefit.
+
+### New files
+
+| File | Purpose |
+|------|---------|
+| `internal/discovery/hackertarget_discoverer.go` | HackerTarget passive DNS API |
+| `internal/discovery/wayback_discoverer.go` | Wayback Machine CDX API |
+| `internal/discovery/multi_source_discoverer.go` | Fan-out aggregator |
+| `internal/discovery/ptr_enricher.go` | Reverse DNS enrichment |
+| `internal/discovery/dns_intel.go` | TXT/MX service indicator scanner |
+| `pkg/models/asset.go` | Added `ServiceIndicator` type |
+
+All new files follow the same interface-injection pattern as existing code. All new functionality is covered by table-driven unit tests using inline mocks; no external network calls are required by any test.
+
+---
+
 ## What comes next
 
 ### Phase 5 — Go vs Python benchmarking
