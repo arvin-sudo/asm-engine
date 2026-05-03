@@ -3,6 +3,7 @@ package fingerprint
 import (
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -177,12 +178,16 @@ func (f *BannerFingerprinter) probeHTTP(conn net.Conn, port models.Port) (string
 //
 // Callers are responsible for setting a deadline on conn before calling this
 // method — readBanner is a pure reader and does not modify connection state.
-// A partial read (EOF, deadline exceeded) is not an error — whatever bytes
-// arrived are returned as-is, because partial banners still contain useful data.
+//
+// io.ReadAll loops until EOF or error, which matters for multi-segment TCP
+// responses (e.g. HTTP headers split across two packets). A single conn.Read
+// would return on the first segment and silently miss any Server: header that
+// arrives in a later one. The deadline fires on the connection when we have
+// waited long enough, causing ReadAll to return whatever arrived — so a partial
+// read is still not treated as an error.
 func (f *BannerFingerprinter) readBanner(conn net.Conn) (string, error) {
-	buf := make([]byte, f.readLimit)
-	n, _ := conn.Read(buf)
-	return strings.TrimSpace(string(buf[:n])), nil
+	data, _ := io.ReadAll(io.LimitReader(conn, int64(f.readLimit)))
+	return strings.TrimSpace(string(data)), nil
 }
 
 // parseServiceBanner extracts a service name and version from a raw banner
@@ -265,15 +270,20 @@ func parseHTTPBanner(banner string) (name, version string) {
 //
 // Both protocols open with "220 <hostname|software> ..." on connection. The
 // distinguishing signal is whether the banner mentions known software keywords.
+//
+// SMTP is checked first because the FTP case includes the bare keyword "ftp",
+// which can appear in hostnames (e.g. "smtp-ftp-relay.corp.com ESMTP Postfix").
+// Specific SMTP identifiers (postfix, sendmail, esmtp, smtp) take priority so
+// that banner context determines the match, not accidental substrings.
 func parseFTPSMTPBanner(banner string) (name, version string) {
 	lower := strings.ToLower(banner)
 	switch {
-	case strings.Contains(lower, "ftp"), strings.Contains(lower, "proftpd"),
-		strings.Contains(lower, "vsftpd"), strings.Contains(lower, "pure-ftpd"):
-		name = "ftp"
 	case strings.Contains(lower, "postfix"), strings.Contains(lower, "sendmail"),
 		strings.Contains(lower, "esmtp"), strings.Contains(lower, "smtp"):
 		name = "smtp"
+	case strings.Contains(lower, "proftpd"), strings.Contains(lower, "vsftpd"),
+		strings.Contains(lower, "pure-ftpd"), strings.Contains(lower, "ftp"):
+		name = "ftp"
 	default:
 		// 220 is used by several other protocols too; leave name empty
 		// rather than misclassify.

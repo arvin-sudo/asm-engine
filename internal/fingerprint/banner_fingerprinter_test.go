@@ -100,9 +100,22 @@ func TestParseServiceBanner_FTP(t *testing.T) {
 }
 
 func TestParseServiceBanner_SMTP(t *testing.T) {
-	name, _ := parseServiceBanner("220 mail.example.com ESMTP Postfix (2.10.1)")
-	if name != "smtp" {
-		t.Errorf("parseServiceBanner(SMTP) = %q, want %q", name, "smtp")
+	tests := []struct {
+		name   string
+		banner string
+	}{
+		{"postfix greeting", "220 mail.example.com ESMTP Postfix (2.10.1)"},
+		// "ftp" appears in the hostname but the banner is SMTP — the FTP keyword
+		// must not shadow the SMTP classification.
+		{"smtp banner with ftp in hostname", "220 smtp-ftp-relay.corp.com ESMTP Sendmail"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, _ := parseServiceBanner(tt.banner)
+			if got != "smtp" {
+				t.Errorf("parseServiceBanner(%q) = %q, want %q", tt.banner, got, "smtp")
+			}
+		})
 	}
 }
 

@@ -120,10 +120,12 @@ func (s *TCPScanner) Scan(asset models.Asset) ([]models.Port, error) {
 	}
 	close(jobs)
 
-	// Close results only after all workers finish. Running the wait in a
-	// separate goroutine lets the main goroutine drain results concurrently,
-	// which prevents a deadlock when the number of open ports exceeds the
-	// results channel buffer.
+	// Close results only after all workers finish. This must happen in a
+	// dedicated goroutine because: (a) the main goroutine is blocked draining
+	// results and cannot call close itself, and (b) any individual worker
+	// finishing does not mean all workers are done — only the WaitGroup knows
+	// when the last one exits. Closing results causes the for-range below to
+	// terminate naturally.
 	go func() {
 		wg.Wait()
 		close(results)

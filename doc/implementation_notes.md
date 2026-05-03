@@ -22,6 +22,10 @@ Each stage is isolated behind an interface. No stage knows how the previous one 
 
 ---
 
+## What is ASM
+asm, or attack surface management is one of the biggest defensive aresenals in cybersecurity. but what is it and why should you be considering it? What is an attack surface?: an organizations attack surface is the sum total of all potential routes an attacker could attempt to use as a point of initial entry. for example, an attack surface could be comprised of a log-in web form an attacker could attempt to brute force, a misconfigured cloud bucket thats open to public access, an unpatched java application running on a dusty server you though was decommissioned years ago, and even systems in your partner supply chain, like an invoicing and accounting system that has access to your network. these plus every other potential point of entry exposed to an attacker, go into forming the total attack surface of an organization. and in simplistic terms, shrking the size of that attack surface reduces and organizations vulnerability to attack. and the smaller the target, the easier it is to protect. organizations attack surfaces vary massievely, from small businesses that have very little digital infrastructure, all the way to global energy and telecommunications companies with thousands, if not millions, of IoT devices and sensors monitoring every aspect of their supply chain. now that attack surface is established, what is it that attack surface management does? if we look at how an attacker would understand an organizations attack surface, typically theyd use an open source tool like Kali Linux to go away and crawl a companys online presence. or in other words, use a computer to try the handle on every possible door, one by one, until they find all of them. once that attack surface has been mapped, typically the would then attempt to understand more about what software is running that may be out of date and vulnerable to known attacks that they could then use to try and force the foor open and gain entry to your organization. if we now look at how an cyber security defender team works, how can we use this knowledge to better defend ourselves? many busineses are deploying attack surface management solutions to help them take an outside-in view on their security posture. asm solutions scan your digital presence much like an attacker would, often exposing those shadow IT resources, like cloud services without an owner, and old servers running unpatched software. its mostly about awareness. there will always be vulnerabilities and zero-day attacks that a business need to address, but they're only able to do that on the subsection of the IT estate that they're actively tracking and aware of. through robust vulnerability management practices, businesses should always ssek to minimize the number of systems they know about which are exposed to attack, this "known and exposed" section in the middle of to the left "unknown and exposed" and to the right "known and unexposed". by giving businesses and outside-in view on their attack surface, ASM helps move items from the most risky "unknown and exposed" category over to the "known and exposed" category, and then prioritize in what order to move those over to the "known and unexposed" category. in other words, it helps them take the fastest path to reduce their risk by discovering unknown assets, then patching the systems which are at most risk first. the best asm systems are able to deliver this entirely from the cloud without any software to deploy, and build an ethos of cyclical and ongoing improvements in to the workflow, much like sparring with an attacker or playing cat and mouse, to improve and validate defenses on an iterative basis. this is typically a four step process: firstly discovering unknown attack surfaces. secondly, gaining insight and a deep understanding of them, finding out what that tool is actually doing. thirdly, prioritizing which of these targets are most tempting to attackers and iteratively improving the risk posture. 4th and finally, testing to validate the effectiveness of your actions. throughout this, asm is continously providing businesses an attackers point of view. it should help business to understand which are their most tempting targets. 
+
+
 ## Repository Layout
 
 ```
@@ -490,6 +494,30 @@ The comment said "simulate an asset that resolves to two IPs" but the asset's `I
 ### New test — HTTPS fingerprinting path (`grabHTTPSBanner`)
 
 `grabHTTPSBanner` uses `tls.DialWithDialer` with `InsecureSkipVerify: true` — the only non-trivial code path with no test coverage. The test uses `net/http/httptest.NewTLSServer` (standard library), which creates a real TLS listener with a self-signed certificate. Because the fingerprinter intentionally skips certificate verification, the self-signed cert is not a problem — this is the exact same scenario as scanning an external host with a misconfigured or self-signed certificate. The test server responds with `Server: apache/2.4.41` and the fingerprinter correctly extracts name and version.
+
+---
+
+## Third Refactor Pass (pre Phase 3)
+
+A third full codebase review before moving to Phase 3. `go vet`, `go build`, and `-race` all clean. Three issues found and fixed.
+
+### Bug fix — `readBanner` single-read may miss multi-segment TCP responses
+
+**The bug:** `readBanner` called `conn.Read(buf)` once and returned whatever bytes arrived. TCP is a stream protocol — a response can arrive in multiple segments (common with HTTP headers under load or across high-latency links). The first `Read` returns on the first segment, even if more bytes are already in the kernel buffer or arriving momentarily. This meant the `Server:` header in an HTTP response could be silently lost if it arrived in a second TCP segment, leaving the fingerprinter with no service name despite a successful probe.
+
+**The fix:** `io.ReadAll(io.LimitReader(conn, int64(f.readLimit)))` loops internally until it receives EOF or an error. When the connection's deadline fires, `ReadAll` returns whatever was accumulated — so partial reads are still valid output. The `LimitReader` wrapper prevents memory exhaustion if a service streams data continuously. This is strictly more correct than a single `Read` with no additional complexity cost.
+
+### Bug fix — `parseFTPSMTPBanner` wrong detection order causes misclassification
+
+**The bug:** The FTP case was listed before the SMTP case and included the bare keyword `"ftp"`. A `220` greeting like `"220 smtp-ftp-relay.corp.com ESMTP Sendmail"` — where "ftp" appears only as a hostname component — would match FTP and never reach the SMTP case. A real-world SMTP server would be misclassified as FTP.
+
+**The fix:** SMTP keywords (`postfix`, `sendmail`, `esmtp`, `smtp`) are now checked first. They are unambiguous identifiers that do not naturally appear in FTP banners. The bare `"ftp"` keyword stays in the FTP case but only fires after SMTP has been ruled out. A new test covers a Sendmail banner whose hostname contains "ftp" — confirming the ordering is now correct.
+
+The principle: when multiple keyword sets have overlapping reach, check the most specific set first. "esmtp" in a banner unambiguously means SMTP; "ftp" in a banner is only reliable when no SMTP keyword is also present.
+
+### Comment fix — misleading deadlock claim in `TCPScanner.Scan`
+
+The closer goroutine comment claimed it "prevents a deadlock when the number of open ports exceeds the results channel buffer." The buffer is sized to `total` (every possible open port), so it can never be exceeded — the stated condition cannot occur. The comment now accurately describes the two real reasons the closer must run in a separate goroutine: the main goroutine is blocked draining results and cannot close the channel itself, and no individual worker finishing is sufficient to signal completion — only the WaitGroup knows when the last worker exits.
 
 ---
 
