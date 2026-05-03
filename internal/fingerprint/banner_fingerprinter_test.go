@@ -160,9 +160,9 @@ func TestParseServiceBanner_SMTP(t *testing.T) {
 		// "ftp" appears in the hostname but the banner is SMTP — the FTP keyword
 		// must not shadow the SMTP classification.
 		{"smtp banner with ftp in hostname", "220 smtp-ftp-relay.corp.com ESMTP Sendmail"},
-		// Bare keywords (without the ESMTP prefix) must also be recognised.
+		// Bare software keywords (without the ESMTP prefix) must also be recognised.
 		{"bare postfix keyword", "220 mail.example.com Postfix"},
-		{"bare smtp keyword", "220 smtp.corp.com ready"},
+		{"bare sendmail keyword", "220 mail.example.com Sendmail 8.14.9/8.14.9"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -171,6 +171,16 @@ func TestParseServiceBanner_SMTP(t *testing.T) {
 				t.Errorf("parseServiceBanner(%q) = %q, want %q", tt.banner, got, "smtp")
 			}
 		})
+	}
+}
+
+func TestParseServiceBanner_FTPHostnameContainsSMTP(t *testing.T) {
+	// "smtp" appears only in the FTP server's hostname — the bare keyword check
+	// was removed precisely to avoid this false positive. The server announces
+	// itself as ProFTPD, so it must be classified as FTP, not SMTP.
+	name, _ := parseServiceBanner("220 ftp.smtp-gateway.example.com ProFTPD 1.3.6 Server ready.")
+	if name != "ftp" {
+		t.Errorf("parseServiceBanner(FTP with smtp in hostname) = %q, want %q", name, "ftp")
 	}
 }
 

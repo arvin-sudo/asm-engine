@@ -1040,6 +1040,131 @@ The change follows the existing SSH / HTTP / FTP-SMTP parser pattern exactly: on
 
 ---
 
+## Eleventh Refactor Pass — Differential Analysis, Vulnerability Mapping, and Technology Stack Fingerprinting
+
+One bug fix, one architectural comment, two storage methods, and three new packages. `go build`, `go vet`, and `go test -race ./...` all clean.
+
+### Bug fix — false-positive SMTP classification in `parseFTPSMTPBanner`
+
+`parseFTPSMTPBanner` matched the bare substring `"smtp"` in any 220 banner. A banner like `"220 ftp.smtp-gateway.example.com ProFTPD 1.3.6 Server ready."` contains `"smtp"` in the hostname and was misclassified as an SMTP server despite being FTP. The bare keyword was removed; the remaining identifiers — `"postfix"`, `"sendmail"`, `"esmtp"` — are unambiguous and sufficient for practical detection.
+
+### Architectural comment — `probeHTTP` Host header limitation
+
+`BannerFingerprinter.probeHTTP` sets `Host: ip:port`. On servers doing virtual hosting this produces a default-vhost response, not the intended site's response. Rather than change the `Fingerprinter` interface (a breaking change), a comment was added to `probeHTTP` documenting the limitation and pointing to `WebFingerprinter` as the architectural resolution.
+
+### Storage layer — `FindPorts` and `FindServices`
+
+Two read methods were added to the `Store` interface and implemented in `PostgresStore`:
+
+- `FindPorts(domain string) ([]models.Port, error)` — queries the `ports` table ordered by `ip, number`.
+- `FindServices(domain string) ([]models.Service, error)` — queries the `services` table ordered by `ip, port_number`.
+
+Both are used by the differ to snapshot historical state before overwriting it with new scan results.
+
+---
+
+### Feature 1 — Differential Analysis (`internal/analysis`)
+
+**Package:** `internal/analysis`
+**New files:** `differ.go`, `differ_test.go`
+**New model file:** `pkg/models/diff.go`
+
+The differ computes what changed between the current scan and the previous scan stored in the database. It depends on a narrow `HistoryReader` interface (not `Store` directly — Interface Segregation), so it has no knowledge of PostgreSQL or any persistence mechanism.
+
+**Types in `pkg/models/diff.go`:**
+
+- `ChangeKind` — `"NEW ASSET"`, `"PORT OPENED"`, `"PORT CLOSED"`, `"VERSION CHANGE"`
+- `AssetChange` — domain + kind
+- `PortChange` — Port + kind
+- `ServiceChange` — port, service name, old version, new version
+- `ScanDiff` — all three change slices; `IsEmpty()` method
+
+**`Differ` methods:**
+
+- `DiffAssets(current []models.Asset)` — compares current domain list against historical `AssetRecord` set; emits `ChangeNewAsset` for domains not previously seen.
+- `DiffAsset(domain string, currentPorts []models.Port, currentServices []models.Service)` — port diff is a symmetric set difference keyed on `ip:number/proto`; service version diff compares non-empty versions pairwise.
+
+The differ is wired automatically in `main.go` whenever `--db` is supplied. The output block appears after Phase 2 completes:
+
+```
+--- Differential Analysis ---
+[NEW ASSET]       dev-api.example.com (never seen before)
+[PORT OPENED]     1.2.3.4:5432/tcp
+[VERSION CHANGE]  nginx  1.18.0 → 1.24.0  (api.example.com)
+(no changes)
+```
+
+---
+
+### Feature 2 — Vulnerability Mapping (`internal/vulndb`)
+
+**Package:** `internal/vulndb`
+**New files:** `vulndb.go`, `vulndb_test.go`
+
+`VulnDB` maps `(service name, version)` pairs to a hardcoded set of known CVEs. The matching logic handles two version formats:
+
+- Dotted-decimal: `"1.18.0"`, `"2.4.49"` — standard `major.minor.patch` comparison.
+- OpenSSH format: `"8.4p1"` — `p` is treated as an additional numeric component, so `"8.4p1"` becomes `[8, 4, 1]` for comparison.
+
+`compareVersions(a, b string) int` returns −1/0/+1. Rules specify a `minVersion` and `maxVersion`; an empty bound means unbounded. An empty version passed to `Check()` returns no results (no guessing).
+
+**Initial CVE dataset (15 rules):**
+
+| Service | Rule | CVE | Severity |
+|---------|------|-----|----------|
+| openssh | < 9.8p1 (with min 8.5p1) | CVE-2024-6387 | CRITICAL |
+| openssh | < 7.6 | CVE-2018-15473 | MEDIUM |
+| apache  | 2.4.49–2.4.50 | CVE-2021-41773 | CRITICAL |
+| apache  | < 2.4.52 | CVE-2021-44790 | HIGH |
+| nginx   | < 1.20.1 | CVE-2021-23017 | HIGH |
+| smtp    | unconditional | CVE-2023-51764 | HIGH |
+| ftp     | unconditional | CVE-2023-48795 | HIGH |
+| imap    | unconditional | CVE-2024-23184 | HIGH |
+| pop3    | unconditional | CVE-2024-23184 | HIGH |
+| http    | unconditional | — | LOW (informational) |
+
+`VulnerabilityChecker` is an interface so `main.go` and tests can inject mocks or alternative implementations without coupling to `VulnDB` directly.
+
+In `main.go`, after fingerprinting each service, matched CVEs are printed immediately below the service line:
+
+```
+      22/tcp   openssh   8.4p1
+               [CRITICAL CVE-2024-6387: regreSSHion — unauthenticated RCE (pre-9.8p1)]
+```
+
+---
+
+### Feature 3 — Technology Stack Fingerprinting (`internal/fingerprint`)
+
+**New files:** `web_stack_fingerprinter.go`, `web_stack_fingerprinter_test.go`
+**Modified:** `fingerprinter.go` (new `WebFingerprinter` interface)
+
+`WebStackFingerprinter` issues a `GET / HTTP/1.1` with `Host: domain` (not `Host: ip:port`) and inspects both response headers and the first 8 KiB of the HTML body for technology signatures.
+
+**Why GET instead of HEAD?** HEAD returns only headers. The highest-value technology signals — WordPress `wp-content/` paths, React `data-reactroot`, Next.js `__NEXT_DATA__` — live in the body. HEAD would miss all of them.
+
+**Why a separate type from `BannerFingerprinter`?** Single Responsibility: `BannerFingerprinter` identifies the protocol and service software. `WebStackFingerprinter` identifies the application layer built on top. They operate at different abstraction levels (service vs. application) and different connection lifecycles (one-shot banner read vs. full HTTP/1.1 exchange).
+
+**Detection coverage:**
+
+- **Headers:** `X-Powered-By` (PHP, ASP.NET, Express, Next.js), `X-Aspnet-Version`, `X-Aspnetmvc-Version`, `X-Generator`, `X-Drupal-Cache`
+- **Cookies:** `PHPSESSID`→PHP, `JSESSIONID`→Java/Tomcat, `ASP.NET_SessionId`→ASP.NET, `laravel_session`→Laravel, `_session_id`→Ruby on Rails
+- **Body patterns:** `wp-content/`→WordPress, `sites/default/files`→Drupal, `__next_data__`→Next.js, `__vue_app__`→Vue.js, `ng-version=`→Angular, `data-reactroot`→React, `gatsby-announcer`→Gatsby, `__svelte`→Svelte
+
+All body patterns are stored lowercase; matching is done against `strings.ToLower(body)` to ensure case-insensitive detection. Results are deduplicated by technology name.
+
+In `main.go`, technology findings are printed below the service line on HTTP/HTTPS ports:
+
+```
+      443/tcp  nginx   1.18.0
+               Tech: WordPress (CMS) — HTML: wp-content/ detected
+               Tech: PHP (Language) — X-Powered-By: PHP/7.4.33
+```
+
+The `webServiceNames` map gates web fingerprinting to HTTP-speaking services (nginx, apache, iis, http, https) and the standard HTTP/HTTPS ports (80, 443, 8080, 8443, 8888), preventing wasted connections to SSH or database ports.
+
+---
+
 ## What comes next
 
 ### Phase 5 — Go vs Python benchmarking

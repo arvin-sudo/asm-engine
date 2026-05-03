@@ -224,3 +224,84 @@ func TestPostgresStore_FindAssets_Empty(t *testing.T) {
 	// A nil slice is a valid empty result in Go — just check the call succeeds.
 	_ = records
 }
+
+func TestPostgresStore_FindPorts(t *testing.T) {
+	// Verify that FindPorts returns the ports saved for a domain, and that
+	// querying an unknown domain returns an empty result without error.
+	s := openStore(t)
+	const domain = "integration-test-findports.example.com"
+	t.Cleanup(func() { cleanAsset(t, s, domain) })
+
+	if err := s.SaveAsset(models.Asset{Domain: domain, IPs: []string{"10.0.1.1"}}); err != nil {
+		t.Fatalf("SaveAsset: %v", err)
+	}
+	p1 := models.Port{IP: "10.0.1.1", Number: 80, Proto: "tcp"}
+	p2 := models.Port{IP: "10.0.1.1", Number: 443, Proto: "tcp"}
+	if err := s.SavePort(domain, p1); err != nil {
+		t.Fatalf("SavePort 80: %v", err)
+	}
+	if err := s.SavePort(domain, p2); err != nil {
+		t.Fatalf("SavePort 443: %v", err)
+	}
+
+	got, err := s.FindPorts(domain)
+	if err != nil {
+		t.Fatalf("FindPorts: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("FindPorts: got %d ports, want 2", len(got))
+	}
+	// Results are ordered by ip then port number per the query.
+	if got[0].Number != 80 || got[1].Number != 443 {
+		t.Errorf("FindPorts order: got ports %d,%d, want 80,443", got[0].Number, got[1].Number)
+	}
+
+	// Unknown domain must return empty result, not error.
+	empty, err := s.FindPorts("nonexistent.example.com")
+	if err != nil {
+		t.Fatalf("FindPorts(unknown): unexpected error: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Errorf("FindPorts(unknown): got %d ports, want 0", len(empty))
+	}
+}
+
+func TestPostgresStore_FindServices(t *testing.T) {
+	// Verify that FindServices returns services for a domain, and that a domain
+	// with no services returns an empty result without error.
+	s := openStore(t)
+	const domain = "integration-test-findservices.example.com"
+	t.Cleanup(func() { cleanAsset(t, s, domain) })
+
+	if err := s.SaveAsset(models.Asset{Domain: domain, IPs: []string{"10.0.2.1"}}); err != nil {
+		t.Fatalf("SaveAsset: %v", err)
+	}
+	port := models.Port{IP: "10.0.2.1", Number: 443, Proto: "tcp"}
+	if err := s.SavePort(domain, port); err != nil {
+		t.Fatalf("SavePort: %v", err)
+	}
+	svc := models.Service{Port: port, Name: "nginx", Version: "1.18.0", Banner: "HTTP/1.0 200 OK"}
+	if err := s.SaveService(domain, svc); err != nil {
+		t.Fatalf("SaveService: %v", err)
+	}
+
+	got, err := s.FindServices(domain)
+	if err != nil {
+		t.Fatalf("FindServices: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("FindServices: got %d services, want 1", len(got))
+	}
+	if got[0].Name != "nginx" || got[0].Version != "1.18.0" {
+		t.Errorf("FindServices: got name=%q version=%q, want nginx/1.18.0", got[0].Name, got[0].Version)
+	}
+
+	// Domain with no services must return empty result, not error.
+	empty, err := s.FindServices("nonexistent.example.com")
+	if err != nil {
+		t.Fatalf("FindServices(unknown): unexpected error: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Errorf("FindServices(unknown): got %d services, want 0", len(empty))
+	}
+}

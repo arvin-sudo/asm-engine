@@ -21,11 +21,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/arvin-sudo/asm-engine/internal/analysis"
 	"github.com/arvin-sudo/asm-engine/internal/cloudscan"
 	"github.com/arvin-sudo/asm-engine/internal/discovery"
 	"github.com/arvin-sudo/asm-engine/internal/fingerprint"
 	"github.com/arvin-sudo/asm-engine/internal/scanner"
 	"github.com/arvin-sudo/asm-engine/internal/storage"
+	"github.com/arvin-sudo/asm-engine/internal/vulndb"
 	"github.com/arvin-sudo/asm-engine/pkg/models"
 )
 
@@ -40,9 +42,21 @@ var defaultPorts = []int{
 	993, 995, 1433, 3306, 3389, 5432, 6379, 8080, 8443, 8888, 27017,
 }
 
+// webServiceNames is the set of service names for which web technology
+// fingerprinting is attempted. Only services that speak HTTP benefit from a
+// full GET request; running it against SSH or a database port wastes a
+// round-trip and produces no useful output.
+var webServiceNames = map[string]bool{
+	"http":   true,
+	"https":  true,
+	"nginx":  true,
+	"apache": true,
+	"iis":    true,
+}
+
 // main is the CLI entry point.
 //
-// Full pipeline (Phases 1–4):
+// Full pipeline (Phases 1–4 + advanced analysis):
 //
 //	flag --target
 //	  → MultiSourceDiscoverer.Discover     (Phase 1a: CT logs + HackerTarget + WayBack)
@@ -53,12 +67,15 @@ var defaultPorts = []int{
 //	  → TCPScanner.Scan                    (Phase 2: probes open TCP ports with a worker pool)
 //	  → store.SavePort                     (Phase 4: persist each open port)
 //	  → BannerFingerprinter.Fingerprint    (Phase 2: reads service banners / HTTP headers)
+//	  → VulnDB.Check                       (Vuln mapping: annotate with known CVEs)
+//	  → WebStackFingerprinter.FingerprintWeb (Web tech: detect CMS/frameworks on HTTP ports)
 //	  → store.SaveService                  (Phase 4: persist service when name or banner is present)
+//	  → Differ.DiffAssets / DiffAsset      (Diff: compare against previous scan if DB enabled)
 //	  → BucketHunter.Scan                  (Phase 3: probes cloud storage URL patterns)
 //	  → store.SaveBucket                   (Phase 4: persist bucket findings)
 //	  → stdout
 //
-// All store calls are guarded by a nil check — when --db is not supplied the
+// All store calls are guarded by a nil check — when --db is absent the
 // store is nil and the pipeline runs as a pure stdout tool with no side effects.
 func main() {
 	// Strip the default date/time prefix from log output. A CLI tool should
@@ -275,11 +292,45 @@ func main() {
 		// timeout only needs to confirm a port is open (one RTT). Fingerprinting
 		// requires a full request-response cycle, so a slightly longer window
 		// avoids false "no banner" results on services with high initial latency.
-		var fingerprinter fingerprint.Fingerprinter = fingerprint.NewBannerFingerprinter(
+		var bannerFP fingerprint.Fingerprinter = fingerprint.NewBannerFingerprinter(
 			*timeoutFlag+time.Second, 4096,
 		)
 
+		// WebStackFingerprinter runs after banner fingerprinting for HTTP/HTTPS
+		// ports. It issues a full GET with the correct Host header so that
+		// virtual-hosting servers return the intended site, enabling detection
+		// of CMSes and frameworks hidden behind a CDN or reverse proxy.
+		var webFP fingerprint.WebFingerprinter = fingerprint.NewWebStackFingerprinter(
+			*timeoutFlag + time.Second,
+		)
+
+		// VulnDB is wired as VulnerabilityChecker so tests can substitute a
+		// stub without touching the built-in CVE dataset.
+		var vulnChecker vulndb.VulnerabilityChecker = vulndb.New()
+
+		// Differ computes asset and port/version deltas relative to the last
+		// scan stored in the database. Only instantiated when persistence is
+		// active — without a DB there is no history to compare against.
+		var differ *analysis.Differ
+		if store != nil {
+			differ = analysis.NewDiffer(store)
+		}
+
+		// Snapshot the list of known assets BEFORE saving new ones.
+		// DiffAssets needs the pre-scan state to identify newly discovered domains.
+		var assetDiff *models.ScanDiff
+		if differ != nil {
+			assetDiff, err = differ.DiffAssets(liveAssets)
+			if err != nil {
+				log.Printf("diff: assets: %v", err)
+			}
+		}
+
 		totalOpen := 0
+		// perAssetDiffs accumulates per-asset port/service diffs for the
+		// summary printed after all Phase 2 output.
+		var allDiffs []*models.ScanDiff
+
 		for _, asset := range liveAssets {
 			openPorts, err := tcpScanner.Scan(asset)
 			if err != nil {
@@ -300,7 +351,19 @@ func main() {
 				return openPorts[i].Number < openPorts[j].Number
 			})
 
+			// Compute the port/service diff BEFORE saving new results.
+			// SavePort and SaveService update the DB rows; reading history after
+			// the save would always return "no change".
+			var portDiff *models.ScanDiff
+			if differ != nil {
+				portDiff, err = differ.DiffAsset(asset.Domain, openPorts, nil)
+				if err != nil {
+					log.Printf("diff: ports for %q: %v", asset.Domain, err)
+				}
+			}
+
 			fmt.Printf("  %s\n", asset.Domain)
+			var scannedServices []models.Service
 			for _, ip := range asset.IPs {
 				portsForIP := filterByIP(openPorts, ip)
 				if len(portsForIP) == 0 {
@@ -317,12 +380,14 @@ func main() {
 							log.Printf("store: save port %s:%d: %v", p.IP, p.Number, err)
 						}
 					}
-					svc, err := fingerprinter.Fingerprint(p)
+
+					svc, err := bannerFP.Fingerprint(p)
 					if err != nil {
 						// Dial or write failed — port is open but nothing to save or show.
 						fmt.Printf("      %d/tcp   open\n", p.Number)
 						continue
 					}
+
 					// Persist whenever there is something meaningful to store.
 					// A service with no recognised name may still carry a raw banner
 					// worth preserving for manual analysis — the Fingerprinter contract
@@ -334,6 +399,10 @@ func main() {
 							log.Printf("store: save service %s:%d: %v", svc.Port.IP, svc.Port.Number, err)
 						}
 					}
+					if svc.Name != "" || svc.Banner != "" {
+						scannedServices = append(scannedServices, svc)
+					}
+
 					if svc.Name == "" {
 						// Port is open and reachable but the service did not produce
 						// enough information to identify it.
@@ -345,13 +414,98 @@ func main() {
 					} else {
 						fmt.Printf("      %d/tcp   %s\n", p.Number, svc.Name)
 					}
+
+					// Vulnerability check: annotate identified services with
+					// known CVEs immediately below the service line.
+					if vulns := vulnChecker.Check(svc.Name, svc.Version); len(vulns) > 0 {
+						for _, v := range vulns {
+							if v.CVE != "" {
+								fmt.Printf("               [%s %s: %s]\n",
+									v.Severity, v.CVE, v.Description)
+							} else {
+								fmt.Printf("               [%s: %s]\n",
+									v.Severity, v.Description)
+							}
+						}
+					}
+
+					// Technology stack fingerprinting: run a full GET on HTTP/HTTPS
+					// ports to detect CMSes, frameworks, and languages that the
+					// Server header does not expose.
+					if webServiceNames[svc.Name] || p.Number == 80 || p.Number == 443 ||
+						p.Number == 8080 || p.Number == 8443 || p.Number == 8888 {
+						techs, err := webFP.FingerprintWeb(asset.Domain, p)
+						if err == nil && len(techs) > 0 {
+							var techNames []string
+							for _, tech := range techs {
+								if tech.Category != "" {
+									techNames = append(techNames, tech.Name+" ("+tech.Category+")")
+								} else {
+									techNames = append(techNames, tech.Name)
+								}
+							}
+							fmt.Printf("               Tech: %s\n", strings.Join(techNames, ", "))
+						}
+					}
 				}
 			}
 			fmt.Println()
+
+			// Now compute the service version diff using the collected services.
+			if differ != nil && portDiff != nil {
+				svcDiff, err := differ.DiffAsset(asset.Domain, nil, scannedServices)
+				if err != nil {
+					log.Printf("diff: services for %q: %v", asset.Domain, err)
+				} else {
+					// Merge service changes into the port diff result.
+					portDiff.ServiceChanges = append(portDiff.ServiceChanges, svcDiff.ServiceChanges...)
+				}
+				if !portDiff.IsEmpty() {
+					allDiffs = append(allDiffs, portDiff)
+				}
+			}
 		}
 
 		fmt.Printf("Phase 2 complete: %d open port(s) across %d live asset(s).\n",
 			totalOpen, len(liveAssets))
+
+		// -------------------------------------------------------------------------
+		// Differential Analysis summary.
+		// -------------------------------------------------------------------------
+		// Printed after Phase 2 so all scan results appear first. Only shown when
+		// persistence is enabled — without a DB there is no historical state.
+		if differ != nil {
+			fmt.Printf("\n--- Differential Analysis ---\n")
+			anyChange := false
+
+			// New assets discovered since last scan.
+			if assetDiff != nil {
+				for _, c := range assetDiff.AssetChanges {
+					fmt.Printf("  [%-16s] %s\n", c.Kind, c.Domain)
+					anyChange = true
+				}
+			}
+
+			// Per-asset port and version changes.
+			for _, d := range allDiffs {
+				for _, pc := range d.PortChanges {
+					fmt.Printf("  [%-16s] %s:%d/%s on %s\n",
+						pc.Kind, pc.Port.IP, pc.Port.Number, pc.Port.Proto, d.Domain)
+					anyChange = true
+				}
+				for _, sc := range d.ServiceChanges {
+					fmt.Printf("  [%-16s] %s %s → %s on %s:%d\n",
+						models.ChangeVersionChange, sc.ServiceName,
+						sc.OldVersion, sc.NewVersion,
+						sc.Port.IP, sc.Port.Number)
+					anyChange = true
+				}
+			}
+
+			if !anyChange {
+				fmt.Printf("  (no changes detected since last scan)\n")
+			}
+		}
 	} else {
 		fmt.Printf("\nPhase 2: skipped — no live assets to scan.\n")
 	}

@@ -162,6 +162,15 @@ func (f *BannerFingerprinter) grabHTTPSBanner(port models.Port) (string, error) 
 // probeHTTP writes a HEAD / HTTP/1.0 request to conn and reads back the
 // response headers. The deadline is set before writing so the entire
 // round-trip is bounded by f.timeout.
+//
+// The Host header is set to the IP address and port, not the domain name.
+// This is a design limitation of the Fingerprinter interface: Fingerprint
+// only receives a Port (IP + number + proto) with no hostname context.
+// Servers that use virtual hosting may return a generic or default response
+// for an IP-based Host header rather than the intended vhost.
+// The WebFingerprinter interface resolves this by accepting a domain name
+// explicitly — use it when technology-level identification requires the
+// correct Host header.
 func (f *BannerFingerprinter) probeHTTP(conn net.Conn, port models.Port) (string, error) {
 	if err := conn.SetDeadline(time.Now().Add(f.timeout)); err != nil {
 		return "", err
@@ -309,13 +318,16 @@ func parseIMAPBanner(_ string) (name, version string) {
 //
 // SMTP is checked first because the FTP case includes the bare keyword "ftp",
 // which can appear in hostnames (e.g. "smtp-ftp-relay.corp.com ESMTP Postfix").
-// Specific SMTP identifiers (postfix, sendmail, esmtp, smtp) take priority so
-// that banner context determines the match, not accidental substrings.
+// Only specific, unambiguous SMTP identifiers are used — "postfix", "sendmail",
+// and "esmtp" — because the bare keyword "smtp" can appear in hostnames
+// (e.g. "220 ftp.smtp-gateway.example.com ProFTPD 1.3.6") and would cause an
+// FTP server to be misclassified as SMTP. "esmtp" alone is sufficient: any server
+// that announces itself as ESMTP-capable is an SMTP server.
 func parseFTPSMTPBanner(banner string) (name, version string) {
 	lower := strings.ToLower(banner)
 	switch {
 	case strings.Contains(lower, "postfix"), strings.Contains(lower, "sendmail"),
-		strings.Contains(lower, "esmtp"), strings.Contains(lower, "smtp"):
+		strings.Contains(lower, "esmtp"):
 		name = "smtp"
 	case strings.Contains(lower, "proftpd"), strings.Contains(lower, "vsftpd"),
 		strings.Contains(lower, "pure-ftpd"), strings.Contains(lower, "ftp"):

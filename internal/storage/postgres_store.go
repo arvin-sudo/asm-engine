@@ -222,6 +222,67 @@ func (s *PostgresStore) SaveBucket(domain string, bucket models.BucketResult) er
 	return nil
 }
 
+// FindPorts returns all ports previously stored for domain, ordered by ip then
+// port number. The result gives the differential analyser a snapshot of what
+// was open during the last scan so it can compute opened/closed port changes.
+func (s *PostgresStore) FindPorts(domain string) ([]models.Port, error) {
+	rows, err := s.db.Query(`
+		SELECT ip, number, proto
+		FROM   ports
+		WHERE  asset_domain = $1
+		ORDER  BY ip, number
+	`, domain)
+	if err != nil {
+		return nil, fmt.Errorf("find_ports %q: %w", domain, err)
+	}
+	defer rows.Close()
+
+	var ports []models.Port
+	for rows.Next() {
+		var p models.Port
+		if err := rows.Scan(&p.IP, &p.Number, &p.Proto); err != nil {
+			return nil, fmt.Errorf("find_ports scan: %w", err)
+		}
+		ports = append(ports, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("find_ports rows: %w", err)
+	}
+	return ports, nil
+}
+
+// FindServices returns all services previously stored for domain, ordered by
+// ip then port number. The result gives the differential analyser the version
+// history needed to detect software upgrades or downgrades between scans.
+func (s *PostgresStore) FindServices(domain string) ([]models.Service, error) {
+	rows, err := s.db.Query(`
+		SELECT ip, port_number, proto, name, version, banner
+		FROM   services
+		WHERE  asset_domain = $1
+		ORDER  BY ip, port_number
+	`, domain)
+	if err != nil {
+		return nil, fmt.Errorf("find_services %q: %w", domain, err)
+	}
+	defer rows.Close()
+
+	var svcs []models.Service
+	for rows.Next() {
+		var svc models.Service
+		if err := rows.Scan(
+			&svc.Port.IP, &svc.Port.Number, &svc.Port.Proto,
+			&svc.Name, &svc.Version, &svc.Banner,
+		); err != nil {
+			return nil, fmt.Errorf("find_services scan: %w", err)
+		}
+		svcs = append(svcs, svc)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("find_services rows: %w", err)
+	}
+	return svcs, nil
+}
+
 // FindAssets returns every persisted asset together with its first-seen and
 // last-seen timestamps, ordered by domain name.
 //

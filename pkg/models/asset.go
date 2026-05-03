@@ -163,6 +163,35 @@ type ServiceIndicator struct {
 	Evidence string
 }
 
+// Technology is a web framework, CMS, programming language, or library
+// identified from HTTP response headers or HTML content during Phase 2b
+// technology stack fingerprinting.
+//
+// Knowing the technology stack transforms a bare open port into an actionable
+// finding: "443/tcp nginx" is noise, but "443/tcp nginx — WordPress 6.4 + PHP 8.1"
+// tells an analyst which exploit chains to prioritise. Technology identification
+// also catches cases where the Server header is suppressed — a WordPress site
+// behind a CDN that hides the server name is still detectable from wp-content
+// paths in the HTML.
+//
+// Technology lives in pkg/models because cmd/asm/main.go needs to print it
+// alongside Service, and internal/fingerprint produces it. Keeping it here
+// avoids either package importing the other.
+type Technology struct {
+	// Name is the human-readable technology identifier (e.g. "WordPress", "PHP",
+	// "React", "Next.js").
+	Name string
+
+	// Category classifies the technology's role in the stack: "CMS",
+	// "Framework", "Language", "Server", or "Platform".
+	Category string
+
+	// Evidence is the HTTP header value or HTML pattern that triggered the
+	// match, preserved for manual review in case the classification is wrong.
+	// Example: "X-Powered-By: PHP/8.1.2" or "HTML: wp-content path detected".
+	Evidence string
+}
+
 // AssetRecord wraps a fully-resolved Asset with the persistence metadata
 // maintained by the storage layer.
 //

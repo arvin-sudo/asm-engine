@@ -59,6 +59,16 @@ type Store interface {
 	// may have disappeared from the attack surface since the last scan.
 	FindAssets() ([]models.AssetRecord, error)
 
+	// FindPorts returns all ports previously observed for the given asset domain,
+	// ordered by ip then port number. Used by the differential analyser to
+	// compare the current scan's open ports against the last known state.
+	FindPorts(domain string) ([]models.Port, error)
+
+	// FindServices returns all services previously observed for the given asset
+	// domain, ordered by ip then port number. Used by the differential analyser
+	// to detect version changes between scan runs.
+	FindServices(domain string) ([]models.Service, error)
+
 	// Close releases any resources held by the store, such as a database
 	// connection pool. Callers must defer Close immediately after a successful
 	// NewPostgresStore call.
