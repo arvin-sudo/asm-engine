@@ -25,6 +25,7 @@ import (
 	"github.com/arvin-sudo/asm-engine/internal/discovery"
 	"github.com/arvin-sudo/asm-engine/internal/fingerprint"
 	"github.com/arvin-sudo/asm-engine/internal/scanner"
+	"github.com/arvin-sudo/asm-engine/internal/storage"
 	"github.com/arvin-sudo/asm-engine/pkg/models"
 )
 
@@ -41,18 +42,22 @@ var defaultPorts = []int{
 
 // main is the CLI entry point.
 //
-// Current pipeline (Phase 1a + 1b + 2 + 3):
+// Full pipeline (Phases 1–4):
 //
 //	flag --target
 //	  → CTDiscoverer.Discover            (passive CT log recon, no target contact)
 //	  → DNSResolver.Discover             (resolves each subdomain to live IPs)
+//	  → store.SaveAsset                  (Phase 4: persist live asset, optional)
 //	  → TCPScanner.Scan                  (probes open TCP ports with a worker pool)
+//	  → store.SavePort                   (Phase 4: persist each open port)
 //	  → BannerFingerprinter.Fingerprint  (reads service banners / HTTP headers)
+//	  → store.SaveService                (Phase 4: persist identified service)
 //	  → BucketHunter.Scan               (probes cloud storage URL patterns)
+//	  → store.SaveBucket                 (Phase 4: persist bucket findings)
 //	  → stdout
 //
-// Phase 4 (PostgreSQL persistence) will extend the pipeline without changing
-// any inner package.
+// All store calls are guarded by a nil check — when --db is not supplied the
+// store is nil and the pipeline runs as a pure stdout tool with no side effects.
 func main() {
 	// Strip the default date/time prefix from log output. A CLI tool should
 	// print clean error messages — timestamps belong in structured log files,
@@ -63,6 +68,7 @@ func main() {
 	portsFlag := flag.String("ports", "", "comma-separated TCP ports to scan. Default: 21 common ports.")
 	workersFlag := flag.Int("workers", 100, "number of concurrent goroutines for port scanning")
 	timeoutFlag := flag.Duration("scan-timeout", 2*time.Second, "per-connection timeout for port scanning and fingerprinting")
+	dbFlag := flag.String("db", "", "PostgreSQL DSN for persistence, e.g. postgres://user:pass@localhost/asmdb?sslmode=disable. Omit to disable persistence.")
 	flag.Parse()
 
 	// Normalise the domain once at the entry point.
@@ -82,6 +88,24 @@ func main() {
 	ports, err := parsePorts(*portsFlag)
 	if err != nil {
 		log.Fatalf("--ports: %v", err)
+	}
+
+	// -------------------------------------------------------------------------
+	// Phase 4 — optional PostgreSQL persistence.
+	// -------------------------------------------------------------------------
+	// store is typed as the Store interface so any future implementation
+	// (in-memory, SQLite, remote API) can be swapped in without touching the
+	// pipeline below. When --db is absent, store remains nil and every save
+	// call is skipped — the pipeline behaves identically to pre-Phase 4.
+	var store storage.Store
+	if *dbFlag != "" {
+		ps, err := storage.NewPostgresStore(*dbFlag)
+		if err != nil {
+			log.Fatalf("store: %v", err)
+		}
+		defer ps.Close()
+		store = ps
+		fmt.Printf("Persistence enabled — connected to database.\n\n")
 	}
 
 	// -------------------------------------------------------------------------
@@ -108,7 +132,7 @@ func main() {
 	var resolver discovery.Discoverer = discovery.NewDNSResolver(discovery.NewNetResolver())
 
 	var liveAssets []models.Asset
-	var liveCount, wildcardCount int
+	var wildcardCount int
 
 	for _, s := range subdomains {
 		// Wildcards (e.g. "*.example.com") are not valid DNS hostnames and
@@ -131,11 +155,16 @@ func main() {
 		}
 		fmt.Printf("  [live]      %-40s %s\n", asset.Domain, strings.Join(asset.IPs, ", "))
 		liveAssets = append(liveAssets, asset)
-		liveCount++
+		if store != nil {
+			if err := store.SaveAsset(asset); err != nil {
+				log.Printf("store: save asset %q: %v", asset.Domain, err)
+			}
+		}
 	}
 
+	deadCount := len(subdomains) - len(liveAssets) - wildcardCount
 	fmt.Printf("\nResults: %d live, %d wildcard, %d dead — %d total subdomains discovered.\n",
-		liveCount, wildcardCount, len(subdomains)-liveCount-wildcardCount, len(subdomains))
+		len(liveAssets), wildcardCount, deadCount, len(subdomains))
 
 	// -------------------------------------------------------------------------
 	// Phase 2 — TCP port scanning + service fingerprinting.
@@ -189,12 +218,25 @@ func main() {
 				fmt.Printf("    [%s]\n", ip)
 				for _, p := range portsForIP {
 					totalOpen++
+					// Persist the open port before fingerprinting. SavePort must
+					// precede SaveService to satisfy the foreign-key constraint —
+					// a service row references its port row.
+					if store != nil {
+						if err := store.SavePort(asset.Domain, p); err != nil {
+							log.Printf("store: save port %s:%d: %v", p.IP, p.Number, err)
+						}
+					}
 					svc, err := fingerprinter.Fingerprint(p)
 					if err != nil || svc.Name == "" {
 						// Port is open but we could not identify the service.
 						// Print what we know rather than hiding the finding.
 						fmt.Printf("      %d/tcp   open\n", p.Number)
 						continue
+					}
+					if store != nil {
+						if err := store.SaveService(asset.Domain, svc); err != nil {
+							log.Printf("store: save service %s:%d: %v", svc.Port.IP, svc.Port.Number, err)
+						}
 					}
 					if svc.Version != "" {
 						fmt.Printf("      %d/tcp   %-14s %s\n", p.Number, svc.Name, svc.Version)
@@ -231,6 +273,11 @@ func main() {
 	} else {
 		var publicCount, privateCount int
 		for _, b := range buckets {
+			if store != nil {
+				if err := store.SaveBucket(domain, b); err != nil {
+					log.Printf("store: save bucket %q: %v", b.URL, err)
+				}
+			}
 			if b.Accessible {
 				fmt.Printf("  [PUBLIC]   %-60s (%s)\n", b.URL, b.Provider)
 				publicCount++

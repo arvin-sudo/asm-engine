@@ -8,6 +8,14 @@ import (
 	"github.com/arvin-sudo/asm-engine/pkg/models"
 )
 
+const (
+	// providerAWSS3 identifies findings that come from an Amazon S3 endpoint.
+	providerAWSS3 = "aws_s3"
+
+	// providerAzureBlob identifies findings that come from an Azure Blob Storage endpoint.
+	providerAzureBlob = "azure_blob"
+)
+
 // BucketHunter implements CloudScanner by sending HTTP HEAD requests to
 // well-known cloud storage URL patterns derived from the target domain.
 //
@@ -102,17 +110,17 @@ func buildURLs(candidates []string) []urlEntry {
 		entries = append(entries,
 			urlEntry{
 				url:      fmt.Sprintf("https://%s.s3.amazonaws.com", name),
-				provider: "aws_s3",
+				provider: providerAWSS3,
 			},
 			urlEntry{
 				url:      fmt.Sprintf("https://s3.amazonaws.com/%s", name),
-				provider: "aws_s3",
+				provider: providerAWSS3,
 			},
 			urlEntry{
 				// Container is named after the account — the most common
 				// pattern in misconfigured deployments.
 				url:      fmt.Sprintf("https://%s.blob.core.windows.net/%s?restype=container", name, name),
-				provider: "azure_blob",
+				provider: providerAzureBlob,
 			},
 		)
 	}

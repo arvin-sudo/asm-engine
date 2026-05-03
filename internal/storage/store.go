@@ -1,31 +1,66 @@
-// Package storage defines the interface for Phase 4 of the ASM pipeline:
-// persisting discovered assets to a durable data store.
+// Package storage defines the interface and PostgreSQL implementation for
+// Phase 4 of the ASM pipeline: persisting every finding to a durable store
+// and enabling change detection across scan runs.
 //
-// The rest of the engine is completely decoupled from the database technology
-// by this interface. In Phase 4 we will wire in a PostgreSQL implementation
-// that tracks when each asset was first and last seen, enabling change
-// detection over time. For unit tests, an in-memory implementation can be
-// supplied instead. Neither choice requires touching any other package.
+// The rest of the engine is completely decoupled from the database by the
+// Store interface. cmd/asm/main.go wires in the PostgreSQL implementation when
+// --db is supplied; when the flag is absent it holds a nil Store and all save
+// calls are skipped. Unit tests can inject an in-memory stub without a real
+// database.
+//
+// Why PostgreSQL? The upsert semantics (INSERT ... ON CONFLICT DO UPDATE)
+// make it straightforward to implement the FirstSeen/LastSeen pattern without
+// a read-modify-write cycle. The TIMESTAMPTZ column type stores timestamps
+// with time-zone information, which prevents silent data loss when the engine
+// runs on hosts in different time zones.
 package storage
 
 import "github.com/arvin-sudo/asm-engine/pkg/models"
 
-// Store is the contract for reading and writing discovered assets.
+// Store is the contract for persisting and querying ASM findings.
 //
-// The interface is intentionally minimal at this stage — it defines only the
-// operations we need right now. It will be extended in Phase 4 to support
-// subdomain persistence, change tracking (FirstSeen / LastSeen), and filtered
-// queries. Adding methods to an interface is a breaking change in Go, so we
-// grow it deliberately rather than front-loading every possible database
-// operation up front.
+// Every write method uses upsert semantics: a finding that already exists has
+// its LastSeen timestamp updated to now; a new finding is created with both
+// FirstSeen and LastSeen set to now. This makes every scan run additive —
+// running the engine twice against the same target produces one record per
+// finding, not two.
+//
+// The interface is ordered by pipeline stage. Callers must respect the
+// dependency order when writing: SaveAsset before SavePort, SavePort before
+// SaveService. This reflects the foreign-key constraints in the schema —
+// a port record references its asset, and a service record references its port.
 type Store interface {
-	// Save persists asset to the backing store. If an asset with the same
-	// domain already exists, the implementation should update it (upsert)
-	// rather than creating a duplicate. Callers are expected to pass only
-	// valid assets (asset.IsValid() == true).
-	Save(asset models.Asset) error
+	// SaveAsset upserts a live, resolved host. Domain is the natural key.
+	// On first discovery both FirstSeen and LastSeen are set to now.
+	// On subsequent runs only LastSeen is updated, preserving the original
+	// discovery timestamp.
+	SaveAsset(asset models.Asset) error
 
-	// FindAll returns every asset previously stored. The order of the returned
-	// slice is implementation-defined and should not be relied upon by callers.
-	FindAll() ([]models.Asset, error)
+	// SavePort upserts a single open port discovered on an asset.
+	// The (asset_domain, ip, number, proto) tuple is the natural key.
+	// domain must already exist in the store — call SaveAsset first.
+	SavePort(domain string, port models.Port) error
+
+	// SaveService upserts the service identified on an open port.
+	// The (asset_domain, ip, port_number, proto) tuple is the natural key.
+	// When a service name or version changes between scans the row is updated
+	// and LastSeen reflects when the change was observed.
+	// The corresponding port must already exist — call SavePort first.
+	SaveService(domain string, svc models.Service) error
+
+	// SaveBucket upserts a cloud storage finding. URL is the natural key.
+	// When a bucket's accessibility changes between scans (e.g. a public
+	// bucket is locked down) the status and accessible fields are updated.
+	SaveBucket(domain string, bucket models.BucketResult) error
+
+	// FindAssets returns every persisted asset together with its first-seen
+	// and last-seen timestamps. Results are ordered by domain name.
+	// A large gap between LastSeen and the current time indicates the asset
+	// may have disappeared from the attack surface since the last scan.
+	FindAssets() ([]models.AssetRecord, error)
+
+	// Close releases any resources held by the store, such as a database
+	// connection pool. Callers must defer Close immediately after a successful
+	// NewPostgresStore call.
+	Close() error
 }

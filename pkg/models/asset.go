@@ -7,7 +7,10 @@
 // pulling in any business logic.
 package models
 
-import "strings"
+import (
+	"strings"
+	"time"
+)
 
 // Subdomain represents a single hostname discovered during passive recon,
 // before it has been resolved to an IP address.
@@ -137,4 +140,29 @@ type BucketResult struct {
 	// the bucket exists but requires authentication — still a finding because
 	// it confirms the storage asset is real.
 	Accessible bool
+}
+
+// AssetRecord wraps a fully-resolved Asset with the persistence metadata
+// maintained by the storage layer.
+//
+// Why not embed timestamps directly in Asset? Asset is a domain concept:
+// a hostname and its current IP addresses. Timestamps are a persistence
+// concept: when a particular scanner observed those addresses. Merging them
+// would force every part of the pipeline (scanner, fingerprinter, cloud scan)
+// to carry timestamp state they have no use for. AssetRecord is returned only
+// by Store.FindAssets — it never enters the discovery or scanning stages.
+type AssetRecord struct {
+	// Asset embeds the domain and IP data so callers can access record.Domain
+	// and record.IPs directly without an extra field dereference.
+	Asset
+
+	// FirstSeen is the timestamp of the earliest scan run that discovered this
+	// asset. It is set once and never overwritten by subsequent scans.
+	FirstSeen time.Time
+
+	// LastSeen is the timestamp of the most recent scan run that observed this
+	// asset. A large gap between FirstSeen and LastSeen combined with a
+	// LastSeen that lags behind today indicates the asset may have disappeared
+	// from the attack surface.
+	LastSeen time.Time
 }

@@ -667,20 +667,172 @@ strings.ToLower(strings.TrimRight(strings.TrimSpace(*target), "."))
 
 ---
 
-## What comes next
+---
 
-### Phase 4 — PostgreSQL Persistence
+## Sixth Refactor Pass (pre Phase 4)
 
-The `storage.Store` interface is already defined and ready to implement:
+A full codebase review before moving to Phase 4. `go vet`, `go build`, and `-race` all clean. Three issues found and fixed.
+
+### Fix — stale comment in `internal/discovery/http_client.go`
+
+The `HTTPClient` comment said Phase 3 cloud scanning would reuse this interface. Phase 3 was implemented with its own `HeadClient` interface specifically to avoid reuse — adding `Head` to `HTTPClient` would have forced every discoverer to depend on a method it never calls. The comment was updated to explain the actual decision: two narrow interfaces are better than one wide one, even when the underlying type (`*http.Client`) satisfies both.
+
+### Improvement — redundant `liveCount` variable in `main.go`
+
+`liveCount` was incremented in exactly the same code path as `liveAssets = append(liveAssets, asset)`, making `liveCount == len(liveAssets)` an invariant that was never checked. Removing the variable and using `len(liveAssets)` directly eliminates one mental mapping — a reader no longer needs to verify that two things tracking the same quantity agree. A named `deadCount` variable was also introduced to make the summary line readable without mental arithmetic.
+
+### Improvement — magic provider strings in `bucket_hunter.go`
+
+`"aws_s3"` and `"azure_blob"` appeared as raw string literals in `buildURLs`. Adding a third AWS URL pattern in the future would require copy-pasting the string again. Named constants `providerAWSS3` and `providerAzureBlob` give the strings a single canonical location and make `buildURLs` self-documenting.
+
+---
+
+---
+
+## Phase 4 — PostgreSQL Persistence (`internal/storage`)
+
+### Why persistence transforms the engine
+
+Without persistence, every scan run is independent. There is no answer to "when did this subdomain first appear?" or "was port 6379 open last week?" — the output is a point-in-time snapshot with no memory of previous states.
+
+Persistence makes the engine a continuous monitoring tool. Running it daily against the same target and querying the database answers questions that matter to a security team:
+
+- **New assets:** `first_seen` equals today's date → something appeared overnight.
+- **Disappeared assets:** `last_seen` lags days behind today → a host went offline or changed DNS.
+- **Service version changes:** the `version` column changed between runs → a service was upgraded or downgraded, which is both a change event and a potential CVE trigger.
+- **Bucket accessibility changes:** a bucket that was `accessible = false` last week is now `accessible = true` → a misconfiguration was introduced.
+
+### Interface design
 
 ```go
 type Store interface {
-    Save(asset models.Asset) error
-    FindAll() ([]models.Asset, error)
+    SaveAsset(asset models.Asset) error
+    SavePort(domain string, port models.Port) error
+    SaveService(domain string, svc models.Service) error
+    SaveBucket(domain string, bucket models.BucketResult) error
+    FindAssets() ([]models.AssetRecord, error)
+    Close() error
 }
 ```
 
-Phase 4 will add a `FirstSeen` and `LastSeen` timestamp to the schema. Running the tool against the same target on different days and comparing `FindAll()` output enables change detection — new subdomains, new open ports, service version changes. This transforms the engine from a point-in-time scanner into a continuous monitoring tool.
+**Why six methods rather than one `SaveAll`?** The pipeline saves findings as they are discovered, not in a batch at the end. An asset is saved immediately after DNS resolution, before port scanning begins. A port is saved before fingerprinting runs on it. Batching would require buffering the entire scan result in memory and writing it only on success — losing all findings if the process is interrupted mid-scan.
+
+**Why is `Store` an interface rather than a concrete `*PostgresStore`?** The same reason every other dependency in the engine is an interface: `main.go` tests can inject an in-memory stub that verifies the correct methods are called without needing a live database. Phase 5 benchmarking can substitute a no-op store that discards everything to isolate scan performance from I/O performance.
+
+**Why is the store optional (`--db` flag)?** The engine was useful before Phase 4 and must remain useful without a database. Making persistence opt-in means a quick one-off scan still works with a single flag, while production monitoring uses the full pipeline.
+
+### `AssetRecord` in `pkg/models`
+
+```go
+type AssetRecord struct {
+    Asset
+    FirstSeen time.Time
+    LastSeen  time.Time
+}
+```
+
+`AssetRecord` embeds `Asset` rather than wrapping it in a named field. This means callers can write `record.Domain` and `record.IPs` directly without an extra dereference — the embedding makes it read as a natural extension of the asset rather than a database row.
+
+Why does `AssetRecord` live in `pkg/models` and not in `internal/storage`? `FindAssets()` returns it, and `main.go` would need to import it to print the results. If it lived in `internal/storage`, `main.go` would import a package that also imports business-logic packages — the dependency would flow in the wrong direction. Placing it in the shared models package keeps both `storage` and `cmd` independent of each other.
+
+Timestamps are not added to `Asset` itself for the same reason they were not added to `Port` or `Service`: those types are domain concepts (a hostname, a TCP port) with no inherent relationship to when they were observed. Timestamps are a persistence concern. Separating them keeps the domain model free of storage details.
+
+### Database schema
+
+```sql
+CREATE TABLE assets (
+    domain     TEXT        PRIMARY KEY,
+    ips        TEXT[]      NOT NULL,
+    first_seen TIMESTAMPTZ NOT NULL,
+    last_seen  TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE ports (
+    asset_domain TEXT        NOT NULL REFERENCES assets(domain) ON DELETE CASCADE,
+    ip           TEXT        NOT NULL,
+    number       INTEGER     NOT NULL,
+    proto        TEXT        NOT NULL,
+    first_seen   TIMESTAMPTZ NOT NULL,
+    last_seen    TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (asset_domain, ip, number, proto)
+);
+
+CREATE TABLE services (
+    asset_domain TEXT        NOT NULL,
+    ip           TEXT        NOT NULL,
+    port_number  INTEGER     NOT NULL,
+    proto        TEXT        NOT NULL,
+    name         TEXT        NOT NULL DEFAULT '',
+    version      TEXT        NOT NULL DEFAULT '',
+    banner       TEXT        NOT NULL DEFAULT '',
+    first_seen   TIMESTAMPTZ NOT NULL,
+    last_seen    TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (asset_domain, ip, port_number, proto),
+    FOREIGN KEY (asset_domain, ip, port_number, proto)
+        REFERENCES ports(asset_domain, ip, number, proto) ON DELETE CASCADE
+);
+
+CREATE TABLE bucket_results (
+    url        TEXT        PRIMARY KEY,
+    domain     TEXT        NOT NULL,
+    provider   TEXT        NOT NULL,
+    status     INTEGER     NOT NULL,
+    accessible BOOLEAN     NOT NULL,
+    first_seen TIMESTAMPTZ NOT NULL,
+    last_seen  TIMESTAMPTZ NOT NULL
+);
+```
+
+**Why natural keys rather than surrogate integer IDs?** A surrogate `id SERIAL` is convenient for joins but obscures the semantics of uniqueness. A domain is unique by definition — it cannot appear twice in the assets table. A `(asset_domain, ip, number, proto)` tuple uniquely identifies a port on an IP. Using natural keys makes the uniqueness constraint explicit in the schema and prevents the class of bugs where the same port is accidentally inserted twice with different surrogate IDs.
+
+**Why `TIMESTAMPTZ` and not `TIMESTAMP`?** `TIMESTAMP WITHOUT TIME ZONE` stores values with no zone information. If the engine runs on a developer's laptop in Stockholm and the database server is in UTC, inserting `NOW()` in Go and reading it back would disagree by two hours — silently. `TIMESTAMPTZ` stores the UTC instant; the display timezone is a presentation detail. All writes go through `time.Now().UTC()` in Go regardless.
+
+**Why `ON DELETE CASCADE` on ports and services?** If an asset is removed from the database (e.g. a cleanup script purging old records), its ports and services should be removed automatically. Requiring the caller to delete in three separate steps in the right order is an operational hazard. The cascade makes the database self-consistent by construction.
+
+**Why `TEXT[]` for `ips` rather than a separate `asset_ips` table?** A normalised design would put each IP in its own row. That is the right design when IP records need to be queried individually, joined, or compared across assets. For this engine, IPs are always read and written as a unit alongside the domain — there is no use case for "give me all assets that share IP 1.2.3.4". The array column keeps the read and write paths simple without sacrificing any query that the current feature set requires.
+
+### Upsert semantics
+
+Every write uses `INSERT ... ON CONFLICT DO UPDATE`. This is PostgreSQL's atomic upsert: if the row does not exist, it is inserted; if it already exists, the specified columns are updated. The critical invariant is that `first_seen` is never included in the `DO UPDATE` clause — it is set only on the initial insert and never touched again. `last_seen` is always updated to `NOW()`.
+
+```sql
+INSERT INTO assets (domain, ips, first_seen, last_seen)
+VALUES ($1, $2, $3, $3)
+ON CONFLICT (domain) DO UPDATE
+    SET ips       = EXCLUDED.ips,
+        last_seen = EXCLUDED.last_seen
+```
+
+The `$3` appears twice in the VALUES clause — Go's `database/sql` resolves both positions to the same `now` variable. Using `EXCLUDED.last_seen` in the DO UPDATE clause picks up the value from the attempted insert row (which is `now`), rather than requiring a second `$4` parameter with the same value.
+
+### Migration strategy
+
+The schema DDL runs on every startup via `migrate()`, which executes the full `CREATE TABLE IF NOT EXISTS` block. This is idempotent — running it against an already-initialised database is a no-op. The engine does not need a separate migration tool or version table for a schema this size. If the schema needs to change in Phase 5, a new `ALTER TABLE` statement can be added to the migration function.
+
+### Dependency: `github.com/lib/pq`
+
+`lib/pq` is the only external dependency in the project. It is the standard PostgreSQL driver for Go's `database/sql` package — pure Go, no CGO, well-maintained, and the de-facto choice for production Go services that talk to PostgreSQL.
+
+**Why not `pgx`?** `pgx` is a feature-rich PostgreSQL driver with native protocol support and a richer API. For this engine, `database/sql` + `lib/pq` is sufficient: we use standard SQL queries with positional parameters, and the only PostgreSQL-specific feature we rely on is `TEXT[]` arrays via `pq.Array`. Adding `pgx` would bring in a larger dependency for no material benefit at this scale.
+
+### Integration tests
+
+The `PostgresStore` tests are gated behind the `integration` build tag and require a `TEST_DB` environment variable pointing to a live PostgreSQL instance. This follows the same philosophy as the scanner tests — real infrastructure over mocks — but requires an opt-in to avoid failing in environments without PostgreSQL.
+
+```
+TEST_DB="postgres://user:pass@localhost/asmdb_test?sslmode=disable" \
+go test -tags integration ./internal/storage/...
+```
+
+The tests verify:
+- **New asset write:** `SaveAsset` creates a row; `FindAssets` returns it with non-zero timestamps.
+- **Upsert preserves `first_seen`:** Calling `SaveAsset` twice with the same domain must advance `last_seen` while leaving `first_seen` unchanged.
+- **Cascade correctness:** `SavePort` and `SaveService` succeed in order; subsequent upserts on the same keys do not error.
+- **Bucket upsert:** Accessibility changes between calls are reflected in the stored row.
+
+---
+
+## What comes next
 
 ### Phase 5 — Go vs Python benchmarking
 
