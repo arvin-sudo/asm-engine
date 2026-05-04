@@ -40,24 +40,29 @@ const (
 // predictable level regardless of how large the port list grows, trading a
 // small amount of throughput for operational safety.
 type TCPScanner struct {
-	ports   []int
-	timeout time.Duration
-	workers int
+	ports     []int
+	timeout   time.Duration
+	workers   int
+	rateLimit int // max dial attempts per second; 0 = unlimited
 }
 
 // NewTCPScanner constructs a TCPScanner.
 //
 // ports is the list of port numbers to probe; callers choose the set relevant
 // to their scan goal. A zero or negative timeout defaults to 2 s; a zero or
-// negative workers count defaults to 100.
-func NewTCPScanner(ports []int, timeout time.Duration, workers int) *TCPScanner {
+// negative workers count defaults to 100. A zero or negative rateLimit disables
+// throttling — workers dial as fast as the OS and network allow.
+func NewTCPScanner(ports []int, timeout time.Duration, workers, rateLimit int) *TCPScanner {
 	if timeout <= 0 {
 		timeout = defaultTimeout
 	}
 	if workers <= 0 {
 		workers = defaultWorkers
 	}
-	return &TCPScanner{ports: ports, timeout: timeout, workers: workers}
+	if rateLimit < 0 {
+		rateLimit = 0
+	}
+	return &TCPScanner{ports: ports, timeout: timeout, workers: workers, rateLimit: rateLimit}
 }
 
 // Scan probes every (IP, port) combination in asset and returns one Port value
@@ -97,12 +102,29 @@ func (s *TCPScanner) Scan(asset models.Asset) ([]models.Port, error) {
 	// doing any work — wasted initialisation cost for no benefit.
 	poolSize := min(s.workers, total)
 
+	// When rateLimit > 0, a ticker fires at 1/rateLimit intervals. Each worker
+	// reads one tick before dialing, so at most rateLimit connection attempts
+	// are initiated per second across the entire pool. This keeps the outbound
+	// connection rate below thresholds that IDS/firewall systems flag as scanning.
+	// time.NewTicker starts with an empty channel — the first tick (and therefore
+	// the first dial) is delayed by one full interval. Every dial is rate-limited,
+	// including the first.
+	var tokens <-chan time.Time
+	if s.rateLimit > 0 {
+		ticker := time.NewTicker(time.Second / time.Duration(s.rateLimit))
+		defer ticker.Stop()
+		tokens = ticker.C
+	}
+
 	var wg sync.WaitGroup
 	for range poolSize {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for j := range jobs {
+				if tokens != nil {
+					<-tokens
+				}
 				// net.JoinHostPort handles bare IPv6 addresses correctly —
 				// fmt.Sprintf("%s:%d", ip, port) would produce "::1:80" which
 				// is ambiguous. JoinHostPort produces "[::1]:80" as required.

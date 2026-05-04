@@ -36,7 +36,7 @@ func TestTCPScanner_Scan_OpenPort(t *testing.T) {
 	ln, port := startAcceptServer(t)
 	defer ln.Close()
 
-	s := NewTCPScanner([]int{port}, time.Second, 1)
+	s := NewTCPScanner([]int{port}, time.Second, 1, 0)
 	asset := models.Asset{Domain: "localhost", IPs: []string{"127.0.0.1"}}
 
 	got, err := s.Scan(asset)
@@ -55,7 +55,7 @@ func TestTCPScanner_Scan_ClosedPort(t *testing.T) {
 	// Port 1 (tcpmux) is not bound on any developer machine. On localhost, a
 	// refused connection returns immediately (RST), so the short timeout still
 	// completes quickly without risking a flaky slow test.
-	s := NewTCPScanner([]int{1}, 200*time.Millisecond, 1)
+	s := NewTCPScanner([]int{1}, 200*time.Millisecond, 1, 0)
 	asset := models.Asset{Domain: "localhost", IPs: []string{"127.0.0.1"}}
 
 	got, err := s.Scan(asset)
@@ -68,7 +68,7 @@ func TestTCPScanner_Scan_ClosedPort(t *testing.T) {
 }
 
 func TestTCPScanner_Scan_InvalidAsset(t *testing.T) {
-	s := NewTCPScanner([]int{80}, time.Second, 1)
+	s := NewTCPScanner([]int{80}, time.Second, 1, 0)
 	_, err := s.Scan(models.Asset{})
 	if err == nil {
 		t.Fatal("Scan() expected error for invalid asset, got nil")
@@ -81,7 +81,7 @@ func TestTCPScanner_Scan_MultiplePorts(t *testing.T) {
 	defer ln1.Close()
 	defer ln2.Close()
 
-	s := NewTCPScanner([]int{port1, port2}, time.Second, 10)
+	s := NewTCPScanner([]int{port1, port2}, time.Second, 10, 0)
 	asset := models.Asset{Domain: "localhost", IPs: []string{"127.0.0.1"}}
 
 	got, err := s.Scan(asset)
@@ -104,7 +104,7 @@ func TestTCPScanner_Scan_MultipleIPs(t *testing.T) {
 	defer ln1.Close()
 	defer ln2.Close()
 
-	s := NewTCPScanner([]int{port1, port2}, time.Second, 10)
+	s := NewTCPScanner([]int{port1, port2}, time.Second, 10, 0)
 	asset := models.Asset{
 		Domain: "localhost",
 		IPs:    []string{"127.0.0.1", "127.0.0.1"},
@@ -120,11 +120,45 @@ func TestTCPScanner_Scan_MultipleIPs(t *testing.T) {
 }
 
 func TestNewTCPScanner_Defaults(t *testing.T) {
-	s := NewTCPScanner([]int{80}, 0, 0)
+	s := NewTCPScanner([]int{80}, 0, 0, 0)
 	if s.timeout != defaultTimeout {
 		t.Errorf("timeout = %v, want %v", s.timeout, defaultTimeout)
 	}
 	if s.workers != defaultWorkers {
 		t.Errorf("workers = %d, want %d", s.workers, defaultWorkers)
+	}
+	if s.rateLimit != 0 {
+		t.Errorf("rateLimit = %d, want 0", s.rateLimit)
+	}
+}
+
+func TestTCPScanner_Scan_WithRateLimit(t *testing.T) {
+	// Verify that rate-limited scanning still produces correct results.
+	// The rate limit is set high (1000/s) so the test completes quickly while
+	// exercising the token-channel path — correctness, not throughput, is the
+	// invariant being tested here.
+	ln, port := startAcceptServer(t)
+	defer ln.Close()
+
+	s := NewTCPScanner([]int{port}, time.Second, 1, 1000)
+	asset := models.Asset{Domain: "localhost", IPs: []string{"127.0.0.1"}}
+
+	got, err := s.Scan(asset)
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("Scan() returned %d open ports, want 1", len(got))
+	}
+	if got[0].Number != port {
+		t.Errorf("Scan() port = %d, want %d", got[0].Number, port)
+	}
+}
+
+func TestNewTCPScanner_NegativeRateLimitClampedToZero(t *testing.T) {
+	// A negative rate limit is nonsensical; it must be clamped to 0 (unlimited).
+	s := NewTCPScanner([]int{80}, time.Second, 1, -5)
+	if s.rateLimit != 0 {
+		t.Errorf("rateLimit = %d, want 0 after clamping negative value", s.rateLimit)
 	}
 }

@@ -1361,3 +1361,66 @@ The test case for `"apache version predating traversal range"` (version 2.4.41) 
 | `cmd/asm/main.go` | `[PUBLIC]` → `[public]` |
 | `internal/vulndb/vulndb_test.go` | Misleading comment rewritten; distro-suffix test case added |
 | `internal/vulndb/vulndb.go` | `splitVersion` comment explaining distro-suffix approximation |
+
+---
+
+## Fifteenth Improvement Pass (2026-05-04)
+
+Four pre-Phase-5 improvements. All changes pass `go test -race ./...`, `go vet ./...`, and `go build ./...`.
+
+### 1. README — stale roadmap and missing flags
+
+The roadmap showed only Phases 1a, 1b, 2, 3, 4. Phase 1c (PTR enrichment), Phase 1d (DNS intelligence), and the three advanced features (Differential Analysis, Vulnerability Mapping, Technology Stack Fingerprinting) were absent. A Chalmers evaluator or open-source contributor reading the README would have no idea these existed. The roadmap now lists all ten completed items. The Quick Start block now shows all CLI flags with annotated examples including `--rate-limit`.
+
+### 2. GCP Cloud Storage — `internal/cloudscan/bucket_hunter.go`
+
+`BucketHunter` previously covered AWS S3 and Azure Blob but not Google Cloud Storage — the third major cloud provider. Its absence was a gap in the attack surface coverage argument.
+
+Added `providerGCPStorage = "gcp_storage"` constant. `buildURLs` now generates two GCP patterns per candidate name:
+
+- **Path-style**: `https://storage.googleapis.com/<name>` — the standard XML API pattern. Public buckets return 200, private return 403, absent return 404 — same semantics as S3.
+- **Virtual-hosted**: `https://<name>.storage.googleapis.com` — used by some CDN and SDK configurations.
+
+Each candidate now produces 5 probe URLs total (2 AWS + 1 Azure + 2 GCP). Four new test cases were added: GCP path-style public, GCP virtual-hosted private, three-provider combined, and the existing tests pass unchanged (mock defaults to 404 for unregistered URLs).
+
+### 3. Rate limiter — `internal/scanner/tcp_scanner.go`
+
+The project constraints state "network rate-limiting to avoid DoS classification" but there was no explicit rate limiter — only implicit limiting via `--workers` count and `--scan-timeout`. This made the DoS-avoidance claim indefensible in the thesis and gave Phase 5 benchmarking no controlled variable for connection rate.
+
+`TCPScanner` gains a `rateLimit int` field (max dial attempts per second; 0 = unlimited). When `rateLimit > 0`, a `time.NewTicker(time.Second / rateLimit)` feeds a `tokens <-chan time.Time` channel. Each worker reads one token before each dial attempt. Because the channel is shared across all goroutines, exactly `rateLimit` tokens are consumed per second globally — regardless of pool size.
+
+**Critical invariant**: `time.NewTicker` creates an empty channel. The first tick arrives after the first full interval (`1/rateLimit` seconds). The throttle applies from the very first dial — there is no "free first connection." `defer ticker.Stop()` is safe: it runs only after `Scan` returns, which only happens after all workers finish draining the jobs channel (via `wg.Wait()` → `close(results)` → `for range results` completes).
+
+The `--rate-limit` flag wires this into the CLI. The Phase 2 header line prints the active rate when non-zero: `"... 10 conn/s rate limit..."`.
+
+`NewTCPScanner` gains a fourth parameter `rateLimit int`; negative values are clamped to 0. New tests: `TestTCPScanner_Scan_WithRateLimit` (correctness at rateLimit=1000) and `TestNewTCPScanner_NegativeRateLimitClampedToZero`.
+
+### 4. `run()` extraction — `cmd/asm/main.go`
+
+`main.go` had ~200 `fmt.Printf` calls inline in the pipeline. `main_test.go` could only test `parsePorts` and `filterByIP` — the entire pipeline orchestration was untestable without capturing `os.Stdout` globally.
+
+`main()` is now 4 lines. All pipeline logic lives in `run(w io.Writer, args []string) error`. This pattern follows the standard Go CLI idiom and satisfies SOLID:
+
+- **D (Dependency Inversion)**: `run` depends on `io.Writer` (stdlib interface), never on `os.Stdout` (concrete type).
+- **I (Interface Segregation)**: `io.Writer` is a single-method interface — the narrowest possible output contract. A custom `Reporter` with named methods would have been over-abstracted for this use case.
+- **O (Open/Closed)**: New output targets (JSON, structured logs, `io.Discard` for benchmarks) require zero changes to `run`.
+
+`flag.NewFlagSet` replaces the global `flag.CommandLine` — no state leaks between test calls. All `fmt.Printf` → `fmt.Fprintf(w, ...)`. Fatal config errors returned as `error`; non-fatal store/scan errors kept as `log.Printf` to stderr (correct separation: scan output on stdout, error noise on stderr). `flag.ErrHelp` handled explicitly — `--help` returns nil.
+
+Three new tests exercise `run()` directly via `bytes.Buffer`: `TestRun_MissingTarget`, `TestRun_InvalidPorts`, `TestRun_HelpFlag`.
+
+### Bug fixed
+
+`internal/scanner/tcp_scanner.go` comment incorrectly stated "ticker.C has a buffer of 1, so the very first dial starts immediately." `time.NewTicker` creates an empty channel; the first value arrives after one full interval. The comment was corrected to accurately describe the behaviour.
+
+### Files modified
+
+| File | Change |
+|------|--------|
+| `README.md` | Roadmap + Quick Start fully updated |
+| `internal/cloudscan/bucket_hunter.go` | `providerGCPStorage` constant; two GCP URL patterns in `buildURLs` |
+| `internal/cloudscan/bucket_hunter_test.go` | Four new GCP and multi-provider test cases |
+| `internal/scanner/tcp_scanner.go` | `rateLimit` field; ticker token channel in `Scan`; comment bug fixed |
+| `internal/scanner/tcp_scanner_test.go` | Fourth arg on all `NewTCPScanner` calls; two new rate-limit tests |
+| `cmd/asm/main.go` | `run(w io.Writer, args []string) error` extraction; `--rate-limit` flag; `flag.NewFlagSet` |
+| `cmd/asm/main_test.go` | Three new `run()` tests |

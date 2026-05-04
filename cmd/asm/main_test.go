@@ -1,10 +1,43 @@
 package main
 
 import (
+	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/arvin-sudo/asm-engine/pkg/models"
 )
+
+func TestRun_MissingTarget(t *testing.T) {
+	var buf bytes.Buffer
+	err := run(&buf, []string{})
+	if err == nil {
+		t.Fatal("run() expected error when --target is absent, got nil")
+	}
+	if !strings.Contains(err.Error(), "--target") {
+		t.Errorf("run() error = %q, want it to mention --target", err.Error())
+	}
+}
+
+func TestRun_InvalidPorts(t *testing.T) {
+	var buf bytes.Buffer
+	err := run(&buf, []string{"--target", "example.com", "--ports", "abc"})
+	if err == nil {
+		t.Fatal("run() expected error for invalid --ports, got nil")
+	}
+	if !strings.Contains(err.Error(), "--ports") {
+		t.Errorf("run() error = %q, want it to mention --ports", err.Error())
+	}
+}
+
+func TestRun_HelpFlag(t *testing.T) {
+	// --help should exit cleanly (nil error) — it is not a failure condition.
+	var buf bytes.Buffer
+	err := run(&buf, []string{"--help"})
+	if err != nil {
+		t.Errorf("run(--help) returned error %v, want nil", err)
+	}
+}
 
 func TestParsePorts_DefaultsOnEmpty(t *testing.T) {
 	ports, err := parsePorts("")

@@ -103,6 +103,35 @@ func TestBucketHunter_Scan(t *testing.T) {
 			wantAccessible: 1,
 		},
 		{
+			name:   "GCP path-style public bucket is reported",
+			domain: "example.com",
+			responses: map[string]int{
+				"https://storage.googleapis.com/example": http.StatusOK,
+			},
+			wantCount:      1,
+			wantAccessible: 1,
+		},
+		{
+			name:   "GCP virtual-hosted private bucket is reported",
+			domain: "example.com",
+			responses: map[string]int{
+				"https://example.storage.googleapis.com": http.StatusForbidden,
+			},
+			wantCount:      1,
+			wantAccessible: 0,
+		},
+		{
+			name:   "multiple buckets across all three providers are reported",
+			domain: "corp.io",
+			responses: map[string]int{
+				"https://corp.s3.amazonaws.com":                              http.StatusOK,
+				"https://corp.blob.core.windows.net/corp?restype=container": http.StatusForbidden,
+				"https://storage.googleapis.com/corp":                       http.StatusOK,
+			},
+			wantCount:      3,
+			wantAccessible: 2,
+		},
+		{
 			// An empty domain must return immediately without probing any URL.
 			// candidatesFromDomain("") generates names like "" and "-backup" that
 			// produce malformed URLs; the guard prevents those from ever being built.

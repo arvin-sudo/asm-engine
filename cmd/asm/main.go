@@ -12,10 +12,13 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -79,41 +82,42 @@ const (
 	waybackTimeout = 60 * time.Second
 )
 
-// main is the CLI entry point.
-//
-// Full pipeline (Phases 1–4 + advanced analysis):
-//
-//	flag --target
-//	  → MultiSourceDiscoverer.Discover     (Phase 1a: CT logs + HackerTarget + WayBack)
-//	  → DNSResolver.Discover               (Phase 1b: resolve each subdomain to live IPs)
-//	  → PTREnricher.Enrich                 (Phase 1c: reverse DNS enrichment from live IPs)
-//	  → DNSIntelligenceScanner.Scan        (Phase 1d: TXT/MX third-party service indicators)
-//	  → store.SaveAsset                    (Phase 4: persist live asset, optional)
-//	  → TCPScanner.Scan                    (Phase 2: probes open TCP ports with a worker pool)
-//	  → store.SavePort                     (Phase 4: persist each open port)
-//	  → BannerFingerprinter.Fingerprint    (Phase 2: reads service banners / HTTP headers)
-//	  → VulnDB.Check                       (Vuln mapping: annotate with known CVEs)
-//	  → WebStackFingerprinter.FingerprintWeb (Web tech: detect CMS/frameworks on HTTP ports)
-//	  → store.SaveService                  (Phase 4: persist service when name or banner is present)
-//	  → Differ.DiffAssets / DiffAsset      (Diff: compare against previous scan if DB enabled)
-//	  → BucketHunter.Scan                  (Phase 3: probes cloud storage URL patterns)
-//	  → store.SaveBucket                   (Phase 4: persist bucket findings)
-//	  → stdout
-//
-// All store calls are guarded by a nil check — when --db is absent the
-// store is nil and the pipeline runs as a pure stdout tool with no side effects.
+// main is the CLI entry point. It delegates all work to run so that the
+// pipeline can be tested by injecting an io.Writer — tests pass a bytes.Buffer,
+// the live binary passes os.Stdout.
 func main() {
 	// Strip the default date/time prefix from log output. A CLI tool should
 	// print clean error messages — timestamps belong in structured log files,
 	// not in terminal error lines read by a human.
 	log.SetFlags(0)
+	if err := run(os.Stdout, os.Args[1:]); err != nil {
+		log.Fatal(err)
+	}
+}
 
-	target := flag.String("target", "", "target domain to scan (required). Example: --target example.com")
-	portsFlag := flag.String("ports", "", "comma-separated TCP ports to scan. Default: 21 common ports.")
-	workersFlag := flag.Int("workers", 100, "number of concurrent goroutines for port scanning")
-	timeoutFlag := flag.Duration("scan-timeout", 2*time.Second, "per-connection timeout for port scanning and fingerprinting")
-	dbFlag := flag.String("db", "", "PostgreSQL DSN for persistence, e.g. postgres://user:pass@localhost/asmdb?sslmode=disable. Omit to disable persistence.")
-	flag.Parse()
+// run is the full scan pipeline. All output is written to w, which lets tests
+// capture and inspect output without capturing os.Stdout globally. Fatal
+// configuration errors are returned; non-fatal pipeline errors (e.g. a single
+// failed store write) are logged to stderr via log.Printf so they do not
+// interrupt the scan.
+func run(w io.Writer, args []string) error {
+	fs := flag.NewFlagSet("asm-engine", flag.ContinueOnError)
+	// Usage and flag-parse errors go to stderr; scan output goes to w.
+	fs.SetOutput(os.Stderr)
+
+	target := fs.String("target", "", "target domain to scan (required). Example: --target example.com")
+	portsFlag := fs.String("ports", "", "comma-separated TCP ports to scan. Default: 21 common ports.")
+	workersFlag := fs.Int("workers", 100, "number of concurrent goroutines for port scanning")
+	timeoutFlag := fs.Duration("scan-timeout", 2*time.Second, "per-connection timeout for port scanning and fingerprinting")
+	rateLimitFlag := fs.Int("rate-limit", 0, "max TCP connection attempts per second across the worker pool (0 = unlimited). Use to stay below IDS/firewall thresholds.")
+	dbFlag := fs.String("db", "", "PostgreSQL DSN for persistence, e.g. postgres://user:pass@localhost/asmdb?sslmode=disable. Omit to disable persistence.")
+
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
 
 	// Normalise the domain once at the entry point.
 	// • TrimSpace removes accidental whitespace around the flag value.
@@ -126,12 +130,12 @@ func main() {
 	//   candidates; DNS and crt.sh are both case-insensitive.
 	domain := strings.ToLower(strings.TrimRight(strings.TrimSpace(*target), "."))
 	if domain == "" {
-		log.Fatal("--target is required. Example: asm-engine --target example.com")
+		return fmt.Errorf("--target is required. Example: asm-engine --target example.com")
 	}
 
 	ports, err := parsePorts(*portsFlag)
 	if err != nil {
-		log.Fatalf("--ports: %v", err)
+		return fmt.Errorf("--ports: %w", err)
 	}
 
 	// -------------------------------------------------------------------------
@@ -145,11 +149,11 @@ func main() {
 	if *dbFlag != "" {
 		ps, err := storage.NewPostgresStore(*dbFlag)
 		if err != nil {
-			log.Fatalf("store: %v", err)
+			return fmt.Errorf("store: %w", err)
 		}
 		defer ps.Close()
 		store = ps
-		fmt.Printf("Persistence enabled — connected to database.\n\n")
+		fmt.Fprintf(w, "Persistence enabled — connected to database.\n\n")
 	}
 
 	// -------------------------------------------------------------------------
@@ -170,14 +174,14 @@ func main() {
 		discovery.NewWayBackDiscoverer(&http.Client{Timeout: waybackTimeout}),
 	)
 
-	fmt.Printf("Phase 1a: passive recon for %s (CT logs, HackerTarget, WayBack)...\n\n", domain)
+	fmt.Fprintf(w, "Phase 1a: passive recon for %s (CT logs, HackerTarget, WayBack)...\n\n", domain)
 
 	subdomains, err := subdiscoverer.Discover(domain)
 	if err != nil {
-		log.Fatalf("subdomain discovery failed: %v", err)
+		return fmt.Errorf("subdomain discovery failed: %w", err)
 	}
 
-	fmt.Printf("Found %d subdomains.\n\n", len(subdomains))
+	fmt.Fprintf(w, "Found %d subdomains.\n\n", len(subdomains))
 
 	// -------------------------------------------------------------------------
 	// Phase 1b — DNS resolution of discovered hostnames.
@@ -193,7 +197,7 @@ func main() {
 		// intelligence — they prove a wildcard certificate was issued — so
 		// they are reported separately rather than silently discarded.
 		if s.IsWildcard() {
-			fmt.Printf("  [wildcard]  %s\n", s.Name)
+			fmt.Fprintf(w, "  [wildcard]  %s\n", s.Name)
 			wildcardCount++
 			continue
 		}
@@ -203,10 +207,10 @@ func main() {
 			// NXDOMAIN is expected for stale or decommissioned subdomains.
 			// Dead entries are worth logging: they may indicate abandoned
 			// infrastructure or shadow IT with stale DNS records.
-			fmt.Printf("  [dead]      %s\n", s.Name)
+			fmt.Fprintf(w, "  [dead]      %s\n", s.Name)
 			continue
 		}
-		fmt.Printf("  [live]      %-40s %s\n", asset.Domain, strings.Join(asset.IPs, ", "))
+		fmt.Fprintf(w, "  [live]      %-40s %s\n", asset.Domain, strings.Join(asset.IPs, ", "))
 		liveAssets = append(liveAssets, asset)
 		if store != nil {
 			if err := store.SaveAsset(asset); err != nil {
@@ -216,7 +220,7 @@ func main() {
 	}
 
 	deadCount := len(subdomains) - len(liveAssets) - wildcardCount
-	fmt.Printf("\nPhase 1b complete: %d live, %d wildcard, %d dead — %d total subdomains discovered.\n",
+	fmt.Fprintf(w, "\nPhase 1b complete: %d live, %d wildcard, %d dead — %d total subdomains discovered.\n",
 		len(liveAssets), wildcardCount, deadCount, len(subdomains))
 
 	// -------------------------------------------------------------------------
@@ -227,7 +231,7 @@ func main() {
 	// infrastructure — services that never had public TLS certificates (invisible
 	// to CT logs) and were never indexed by HackerTarget or WayBack.
 	if len(liveAssets) > 0 {
-		fmt.Printf("\nPhase 1c: PTR enrichment on discovered IPs...\n\n")
+		fmt.Fprintf(w, "\nPhase 1c: PTR enrichment on discovered IPs...\n\n")
 
 		// Collect every unique IP from all live assets.
 		var allIPs []string
@@ -251,15 +255,15 @@ func main() {
 				continue
 			}
 			if s.IsWildcard() {
-				fmt.Printf("  [ptr-wildcard]  %s\n", s.Name)
+				fmt.Fprintf(w, "  [ptr-wildcard]  %s\n", s.Name)
 				continue
 			}
 			asset, err := resolver.Discover(s.Name)
 			if err != nil {
-				fmt.Printf("  [ptr-dead]      %s\n", s.Name)
+				fmt.Fprintf(w, "  [ptr-dead]      %s\n", s.Name)
 				continue
 			}
-			fmt.Printf("  [ptr-live]      %-40s %s\n", asset.Domain, strings.Join(asset.IPs, ", "))
+			fmt.Fprintf(w, "  [ptr-live]      %-40s %s\n", asset.Domain, strings.Join(asset.IPs, ", "))
 			liveAssets = append(liveAssets, asset)
 			knownDomains[asset.Domain] = struct{}{}
 			ptrNew++
@@ -269,9 +273,9 @@ func main() {
 				}
 			}
 		}
-		fmt.Printf("\nPhase 1c complete: %d new asset(s) discovered via PTR.\n", ptrNew)
+		fmt.Fprintf(w, "\nPhase 1c complete: %d new asset(s) discovered via PTR.\n", ptrNew)
 	} else {
-		fmt.Printf("\nPhase 1c: skipped — no live assets to enrich.\n")
+		fmt.Fprintf(w, "\nPhase 1c: skipped — no live assets to enrich.\n")
 	}
 
 	// -------------------------------------------------------------------------
@@ -282,7 +286,7 @@ func main() {
 	// SPF includes expose authorised email relays (Mailgun, SendGrid, SES) and
 	// MX records identify the email provider — both are shadow IT indicators
 	// that no amount of subdomain enumeration would otherwise surface.
-	fmt.Printf("\nPhase 1d: DNS intelligence for %s...\n\n", domain)
+	fmt.Fprintf(w, "\nPhase 1d: DNS intelligence for %s...\n\n", domain)
 
 	intelScanner := discovery.NewDNSIntelligenceScanner(discovery.NewNetDNSIntelResolver())
 	indicators, err := intelScanner.Scan(domain)
@@ -291,13 +295,13 @@ func main() {
 	}
 
 	if len(indicators) == 0 {
-		fmt.Println("  No third-party service indicators found.")
+		fmt.Fprintln(w, "  No third-party service indicators found.")
 	} else {
 		for _, ind := range indicators {
-			fmt.Printf("  [%s] %-22s  %s\n", ind.Record, ind.Service, ind.Evidence)
+			fmt.Fprintf(w, "  [%s] %-22s  %s\n", ind.Record, ind.Service, ind.Evidence)
 		}
 	}
-	fmt.Printf("\nPhase 1d complete: %d service indicator(s) found.\n", len(indicators))
+	fmt.Fprintf(w, "\nPhase 1d complete: %d service indicator(s) found.\n", len(indicators))
 
 	// -------------------------------------------------------------------------
 	// Phase 2 — TCP port scanning + service fingerprinting.
@@ -308,10 +312,14 @@ func main() {
 	if len(liveAssets) > 0 {
 		// Declared as the Scanner and Fingerprinter interfaces so that tests
 		// can inject in-memory doubles without changing this file.
-		fmt.Printf("\nPhase 2: scanning %d port(s) on %d live asset(s) — %d workers, %v timeout...\n\n",
+		fmt.Fprintf(w, "\nPhase 2: scanning %d port(s) on %d live asset(s) — %d workers, %v timeout",
 			len(ports), len(liveAssets), *workersFlag, *timeoutFlag)
+		if *rateLimitFlag > 0 {
+			fmt.Fprintf(w, ", %d conn/s rate limit", *rateLimitFlag)
+		}
+		fmt.Fprintf(w, "...\n\n")
 
-		var tcpScanner scanner.Scanner = scanner.NewTCPScanner(ports, *timeoutFlag, *workersFlag)
+		var tcpScanner scanner.Scanner = scanner.NewTCPScanner(ports, *timeoutFlag, *workersFlag, *rateLimitFlag)
 
 		// Give fingerprinting one extra second beyond the scan timeout. The scan
 		// timeout only needs to confirm a port is open (one RTT). Fingerprinting
@@ -359,7 +367,7 @@ func main() {
 		for _, asset := range liveAssets {
 			openPorts, err := tcpScanner.Scan(asset)
 			if err != nil {
-				fmt.Printf("  [scan error] %s: %v\n\n", asset.Domain, err)
+				fmt.Fprintf(w, "  [scan error] %s: %v\n\n", asset.Domain, err)
 				continue
 			}
 
@@ -379,7 +387,7 @@ func main() {
 			}
 
 			if len(openPorts) == 0 {
-				fmt.Printf("  %s — no open ports found\n\n", asset.Domain)
+				fmt.Fprintf(w, "  %s — no open ports found\n\n", asset.Domain)
 				// Still run the diff: if the previous scan recorded open ports
 				// and now none are found, those ports must be reported as closed.
 				if differ != nil && history != nil {
@@ -400,14 +408,14 @@ func main() {
 				return openPorts[i].Number < openPorts[j].Number
 			})
 
-			fmt.Printf("  %s\n", asset.Domain)
+			fmt.Fprintf(w, "  %s\n", asset.Domain)
 			var scannedServices []models.Service
 			for _, ip := range asset.IPs {
 				portsForIP := filterByIP(openPorts, ip)
 				if len(portsForIP) == 0 {
 					continue
 				}
-				fmt.Printf("    [%s]\n", ip)
+				fmt.Fprintf(w, "    [%s]\n", ip)
 				for _, p := range portsForIP {
 					totalOpen++
 					// Persist the open port before fingerprinting. SavePort must
@@ -422,7 +430,7 @@ func main() {
 					svc, err := bannerFP.Fingerprint(p)
 					if err != nil {
 						// Dial or write failed — port is open but nothing to save or show.
-						fmt.Printf("      %d/tcp   open\n", p.Number)
+						fmt.Fprintf(w, "      %d/tcp   open\n", p.Number)
 						continue
 					}
 
@@ -452,23 +460,23 @@ func main() {
 					if svc.Name == "" {
 						// Port is open and reachable but the service did not produce
 						// enough information to identify it.
-						fmt.Printf("      %d/tcp   open\n", p.Number)
+						fmt.Fprintf(w, "      %d/tcp   open\n", p.Number)
 						continue
 					}
 					if svc.Version != "" {
-						fmt.Printf("      %d/tcp   %-14s %s\n", p.Number, svc.Name, svc.Version)
+						fmt.Fprintf(w, "      %d/tcp   %-14s %s\n", p.Number, svc.Name, svc.Version)
 					} else {
-						fmt.Printf("      %d/tcp   %s\n", p.Number, svc.Name)
+						fmt.Fprintf(w, "      %d/tcp   %s\n", p.Number, svc.Name)
 					}
 
 					// Print CVEs from the annotated service struct — no second
 					// Check call needed; the results are already on svc.
 					for _, v := range svc.Vulnerabilities {
 						if v.CVE != "" {
-							fmt.Printf("               [%s %s: %s]\n",
+							fmt.Fprintf(w, "               [%s %s: %s]\n",
 								v.Severity, v.CVE, v.Description)
 						} else {
-							fmt.Printf("               [%s: %s]\n",
+							fmt.Fprintf(w, "               [%s: %s]\n",
 								v.Severity, v.Description)
 						}
 					}
@@ -487,12 +495,12 @@ func main() {
 									techNames = append(techNames, tech.Name)
 								}
 							}
-							fmt.Printf("               Tech: %s\n", strings.Join(techNames, ", "))
+							fmt.Fprintf(w, "               Tech: %s\n", strings.Join(techNames, ", "))
 						}
 					}
 				}
 			}
-			fmt.Println()
+			fmt.Fprintln(w)
 
 			// Compute port and service diffs in a single call using the
 			// pre-scan snapshot. Both ports and services are compared here
@@ -507,7 +515,7 @@ func main() {
 			}
 		}
 
-		fmt.Printf("Phase 2 complete: %d open port(s) across %d live asset(s).\n",
+		fmt.Fprintf(w, "Phase 2 complete: %d open port(s) across %d live asset(s).\n",
 			totalOpen, len(liveAssets))
 
 		// -------------------------------------------------------------------------
@@ -516,13 +524,13 @@ func main() {
 		// Printed after Phase 2 so all scan results appear first. Only shown when
 		// persistence is enabled — without a DB there is no historical state.
 		if differ != nil {
-			fmt.Printf("\n--- Differential Analysis ---\n")
+			fmt.Fprintf(w, "\n--- Differential Analysis ---\n")
 			anyChange := false
 
 			// New assets discovered since last scan.
 			if assetDiff != nil {
 				for _, c := range assetDiff.AssetChanges {
-					fmt.Printf("  [%-16s] %s\n", c.Kind, c.Domain)
+					fmt.Fprintf(w, "  [%-16s] %s\n", c.Kind, c.Domain)
 					anyChange = true
 				}
 			}
@@ -530,12 +538,12 @@ func main() {
 			// Per-asset port and version changes.
 			for _, d := range allDiffs {
 				for _, pc := range d.PortChanges {
-					fmt.Printf("  [%-16s] %s:%d/%s on %s\n",
+					fmt.Fprintf(w, "  [%-16s] %s:%d/%s on %s\n",
 						pc.Kind, pc.Port.IP, pc.Port.Number, pc.Port.Proto, d.Domain)
 					anyChange = true
 				}
 				for _, sc := range d.ServiceChanges {
-					fmt.Printf("  [%-16s] %s %s → %s on %s:%d\n",
+					fmt.Fprintf(w, "  [%-16s] %s %s → %s on %s:%d\n",
 						models.ChangeVersionChange, sc.ServiceName,
 						sc.OldVersion, sc.NewVersion,
 						sc.Port.IP, sc.Port.Number)
@@ -544,11 +552,11 @@ func main() {
 			}
 
 			if !anyChange {
-				fmt.Printf("  (no changes detected since last scan)\n")
+				fmt.Fprintf(w, "  (no changes detected since last scan)\n")
 			}
 		}
 	} else {
-		fmt.Printf("\nPhase 2: skipped — no live assets to scan.\n")
+		fmt.Fprintf(w, "\nPhase 2: skipped — no live assets to scan.\n")
 	}
 
 	// -------------------------------------------------------------------------
@@ -560,7 +568,7 @@ func main() {
 	// the CLI feel frozen. This client is intentionally separate from the one
 	// used in Phase 1a: that one needs Get; this one needs Head. Sharing a
 	// client would require one of the interfaces to grow a method it never uses.
-	fmt.Printf("\nPhase 3: cloud bucket scan for %s...\n\n", domain)
+	fmt.Fprintf(w, "\nPhase 3: cloud bucket scan for %s...\n\n", domain)
 
 	var bucketHunter cloudscan.CloudScanner = cloudscan.NewBucketHunter(&http.Client{
 		Timeout: 10 * time.Second,
@@ -578,19 +586,21 @@ func main() {
 				}
 			}
 			if b.Accessible {
-				fmt.Printf("  [public]   %-60s (%s)\n", b.URL, b.Provider)
+				fmt.Fprintf(w, "  [public]   %-60s (%s)\n", b.URL, b.Provider)
 				publicCount++
 			} else {
-				fmt.Printf("  [private]  %-60s (%s)\n", b.URL, b.Provider)
+				fmt.Fprintf(w, "  [private]  %-60s (%s)\n", b.URL, b.Provider)
 				privateCount++
 			}
 		}
 		if len(buckets) == 0 {
-			fmt.Println("  No cloud buckets found.")
+			fmt.Fprintln(w, "  No cloud buckets found.")
 		}
-		fmt.Printf("\nPhase 3 complete: %d public, %d private bucket(s) found.\n",
+		fmt.Fprintf(w, "\nPhase 3 complete: %d public, %d private bucket(s) found.\n",
 			publicCount, privateCount)
 	}
+
+	return nil
 }
 
 // parsePorts converts a comma-separated port string to a deduplicated slice of

@@ -14,6 +14,9 @@ const (
 
 	// providerAzureBlob identifies findings that come from an Azure Blob Storage endpoint.
 	providerAzureBlob = "azure_blob"
+
+	// providerGCPStorage identifies findings that come from a Google Cloud Storage endpoint.
+	providerGCPStorage = "gcp_storage"
 )
 
 // BucketHunter implements CloudScanner by sending HTTP HEAD requests to
@@ -111,6 +114,12 @@ type urlEntry struct {
 //     as S3. The storage account root alone returns 400 for existing accounts
 //     (no resource type specified), which would require special-casing; the
 //     container URL gives clean 200/403 semantics without that complexity.
+//
+// Two GCP Cloud Storage patterns per candidate:
+//   - Path style (https://storage.googleapis.com/<name>) is the standard
+//     XML API pattern; public buckets return 200, private return 403.
+//   - Virtual-hosted style (https://<name>.storage.googleapis.com) mirrors
+//     S3 virtual hosting and is used by some CDN and SDK configurations.
 func buildURLs(candidates []string) []urlEntry {
 	var entries []urlEntry
 	for _, name := range candidates {
@@ -128,6 +137,14 @@ func buildURLs(candidates []string) []urlEntry {
 				// pattern in misconfigured deployments.
 				url:      fmt.Sprintf("https://%s.blob.core.windows.net/%s?restype=container", name, name),
 				provider: providerAzureBlob,
+			},
+			urlEntry{
+				url:      fmt.Sprintf("https://storage.googleapis.com/%s", name),
+				provider: providerGCPStorage,
+			},
+			urlEntry{
+				url:      fmt.Sprintf("https://%s.storage.googleapis.com", name),
+				provider: providerGCPStorage,
 			},
 		)
 	}
