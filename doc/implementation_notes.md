@@ -31,30 +31,43 @@ asm, or attack surface management is one of the biggest defensive aresenals in c
 ```
 asm-engine/
 ├── cmd/asm/
-│   ├── main.go                  CLI entry point — wiring only, no logic
-│   └── main_test.go             parsePorts + filterByIP unit tests
+│   ├── main.go                      CLI entry point — wiring only, no logic
+│   └── main_test.go                 parsePorts + filterByIP unit tests
 ├── internal/
 │   ├── discovery/
-│   │   ├── discoverer.go        SubdomainDiscoverer + Discoverer interfaces
-│   │   ├── ct_discoverer.go     Phase 1a: queries crt.sh CT logs
-│   │   ├── dns_resolver.go      Phase 1b: resolves hostnames to IPs
-│   │   ├── resolver.go          Resolver interface + net adapter
-│   │   └── http_client.go       HTTPClient interface
+│   │   ├── discoverer.go            SubdomainDiscoverer + Discoverer interfaces
+│   │   ├── http_client.go           HTTPClient interface
+│   │   ├── resolver.go              Resolver + PTRResolver interfaces + net adapters
+│   │   ├── ct_discoverer.go         Phase 1a: queries crt.sh CT logs
+│   │   ├── hackertarget_discoverer.go  Phase 1a: queries HackerTarget passive DNS
+│   │   ├── wayback_discoverer.go    Phase 1a: queries Wayback Machine CDX API
+│   │   ├── multi_source_discoverer.go  Phase 1a: fans out to all three sources
+│   │   ├── dns_resolver.go          Phase 1b: resolves hostnames to live IPs
+│   │   ├── ptr_enricher.go          Phase 1c: reverse DNS enrichment from IPs
+│   │   └── dns_intel.go             Phase 1d: TXT/MX third-party service indicators
 │   ├── scanner/
-│   │   ├── scanner.go           Scanner interface
-│   │   └── tcp_scanner.go       Phase 2a: worker-pool TCP port prober
+│   │   ├── scanner.go               Scanner interface
+│   │   └── tcp_scanner.go           Phase 2a: worker-pool TCP port prober
 │   ├── fingerprint/
-│   │   ├── fingerprinter.go     Fingerprinter interface
-│   │   └── banner_fingerprinter.go  Phase 2b: banner/HTTP service identification
+│   │   ├── fingerprinter.go         Fingerprinter + WebFingerprinter interfaces
+│   │   ├── banner_fingerprinter.go  Phase 2b: banner/HTTP service identification
+│   │   └── web_stack_fingerprinter.go  Phase 2b: HTTP GET + header/body tech detection
 │   ├── cloudscan/
-│   │   ├── cloudscan.go         HeadClient + CloudScanner interfaces
-│   │   └── bucket_hunter.go     Phase 3: cloud storage bucket discovery
-│   └── storage/
-│       ├── store.go             Store interface
-│       └── postgres_store.go    Phase 4: PostgreSQL persistence implementation
+│   │   ├── cloudscan.go             HeadClient + CloudScanner interfaces
+│   │   └── bucket_hunter.go         Phase 3: cloud storage bucket discovery
+│   ├── storage/
+│   │   ├── store.go                 Store interface
+│   │   └── postgres_store.go        Phase 4: PostgreSQL persistence implementation
+│   ├── analysis/
+│   │   └── differ.go                Differential analyser: DiffAssets + DiffAsset
+│   └── vulndb/
+│       └── vulndb.go                VulnerabilityChecker interface + built-in CVE dataset
 └── pkg/models/
-    └── asset.go                 Shared data types: Subdomain, Asset, Port, Service,
-                                 BucketResult, AssetRecord
+    ├── asset.go                     Shared data types: Subdomain, Asset, Port, Service,
+    │                                BucketResult, AssetRecord, ServiceIndicator, Technology
+    ├── diff.go                      Differential analysis types: ScanDiff, AssetHistory,
+    │                                ChangeKind, AssetChange, PortChange, ServiceChange
+    └── vulnerability.go             Vulnerability severity model: Severity, Vulnerability
 ```
 
 The `/pkg/models` package is the only package every other package is allowed to import. The `/internal` packages depend only on `/pkg/models` and on each other's interfaces, never on concrete types from sibling packages. `/cmd` is the only place where concrete types are instantiated and wired together. This layering is the structural guarantee that the pipeline stages remain independent.
@@ -1162,6 +1175,128 @@ In `main.go`, technology findings are printed below the service line on HTTP/HTT
 ```
 
 The `webServiceNames` map gates web fingerprinting to HTTP-speaking services (nginx, apache, iis, http, https) and the standard HTTP/HTTPS ports (80, 443, 8080, 8443, 8888), preventing wasted connections to SSH or database ports.
+
+---
+
+---
+
+## Twelfth Refactor Pass
+
+**Date:** 2026-05-04
+
+Full code review after the Eleventh Refactor Pass. Two silent bugs discovered and fixed, one architectural constraint resolved, and one storage query added.
+
+### Bug 1 — Service version diffs were always silent
+
+**Root cause:** `Differ.DiffAsset` queried `FindServices` from the database internally. In `main.go`, `store.SaveService` was called for each port during the inner scan loop. By the time `DiffAsset` was invoked for services (after the inner loop), the database already held the *new* versions just written. `FindServices` returned the new version; comparing new vs new produced zero `ServiceChange` events. Every service upgrade between scan runs was silently swallowed — the differential output always showed "(no changes)" for service versions even when an upgrade had occurred.
+
+The memory note said: *"Diff pre-snapshot must be taken BEFORE new scan results are saved to DB."* That rule was applied correctly for ports (the port diff call was before saves) but violated for services (the service diff call was after saves).
+
+**The fix:** Separate DB-read from pure computation inside `Differ`.
+
+`LoadAssetHistory(domain string) (*models.AssetHistory, error)` is a new method that fetches ports and services from the database in a single call. It is called in `main.go` once per asset, *before* any `SavePort` or `SaveService` call. The returned `*models.AssetHistory` is held in a local variable for the remainder of that asset's processing.
+
+`DiffAsset` was refactored to accept a `*models.AssetHistory` parameter instead of reading from the database itself. It is now a pure function: no database access, no error return, deterministic output. Correctness proof: the snapshot was taken before any writes, so `history.Services` always contains the previous scan's versions, not the current one's.
+
+### Bug 2 — PORT CLOSED events were never generated when all ports close
+
+**Root cause:** When `tcpScanner.Scan` returned an empty port list, `main.go` printed "no open ports found" and immediately `continue`d to the next asset, skipping the diff block entirely. If an asset previously had open ports and now has none — a common scenario when a service is decommissioned or a firewall rule is tightened — zero PORT CLOSED events were emitted. The differential output for that asset was completely absent.
+
+**The fix:** `LoadAssetHistory` is now called before the `len(openPorts) == 0` guard. When no ports are found, `DiffAsset` is still invoked with `nil` current ports and `nil` services. Because all history ports are absent from the (empty) current set, the pure comparison correctly emits a `ChangePortClosed` for every previously-open port. The asset continues to the next without further processing, but the diff is preserved for the summary block.
+
+### Architectural issue — `Vulnerability` type location
+
+**Problem:** `Vulnerability` and `Severity` were defined in `internal/vulndb`. The `pkg/models` package cannot import internal packages — that is a Go module rule, not a convention. This meant `models.Service` could not carry a `Vulnerabilities []Vulnerability` slice without creating an import cycle that the toolchain rejects.
+
+**Why it matters:** Without this field, vulnerability results were only ever printed ad-hoc in `main.go`, not attached to the service struct. The service's full picture — identity, version, and known CVEs — was scattered across the pipeline rather than travelling together as one unit.
+
+**The fix:** `Vulnerability` and `Severity` (type + four constants) were moved to `pkg/models/vulnerability.go`. `internal/vulndb` now imports from `pkg/models` — a legitimate dependency direction (internal packages are allowed to import pkg). The `VulnerabilityChecker` interface and `VulnDB` implementation stay in `internal/vulndb`; they are business logic, not data types.
+
+`models.Service` gains a new field:
+
+```go
+Vulnerabilities []Vulnerability
+```
+
+In `main.go`, vulnerability annotation is now:
+
+```go
+svc.Vulnerabilities = vulnChecker.Check(svc.Name, svc.Version)
+```
+
+This happens before `SaveService` and before printing. The print loop iterates `svc.Vulnerabilities` directly — no second `Check` call needed. Vulnerabilities are not persisted (the `SaveService` SQL does not include the field) because CVE applicability must be recomputed fresh on every run; a stale snapshot from a past scan could report a CVE that was patched, or miss one that was added to the dataset since the last save.
+
+### Storage enhancement — `FindAssetByDomain`
+
+`FindAssets()` loads the entire assets table. For the differential analyser's new-asset detection, loading all records is correct and necessary. But for future point lookups — a query tool, a reporting layer, or Phase 5 analysis scripts that need one specific asset — reading the full table is wasteful.
+
+`FindAssetByDomain(domain string) (*models.AssetRecord, error)` was added to both the `Store` interface and `PostgresStore`. It executes a single `WHERE domain = $1` lookup. The return convention is `(nil, nil)` when the domain is not found — not an error — so callers can distinguish "not in database" from a connection failure without error inspection.
+
+### DiffAsset call count: 2 → 1 per asset
+
+The previous code called `DiffAsset` twice per asset: once for ports (nil services), once for services (nil ports), then merged the results. Besides being the proximate cause of Bug 1, this pattern caused the database to be queried twice per asset and built port-change sets that were immediately discarded in the second call. After the refactor, `DiffAsset` is called once per asset with both `openPorts` and `scannedServices`. The snapshot is consistent, the computation is pure, and the result is complete in one pass.
+
+### Test changes
+
+- `differ_test.go` — `DiffAsset` tests no longer need a configured mock reader. The historical state is expressed directly as `&models.AssetHistory{Ports: ..., Services: ...}`, making the test setup more explicit and the intent immediately visible. A new case `"all ports closed — history had ports, current is empty"` was added to cover Bug 2's scenario.
+- `differ_test.go` — `TestDiffer_LoadAssetHistory` added: three table-driven cases covering a domain with data, a reader error, and an unknown domain.
+- `postgres_store_test.go` — `TestPostgresStore_FindAssetByDomain` added: integration test verifying `(nil, nil)` for missing domain, correct record retrieval after save.
+
+---
+
+## Thirteenth Refactor Pass (2026-05-04)
+
+### DRY violation — portKey / svcKey
+
+`DiffAsset` defined two local struct types with identical field layouts: `portKey` (`ip`, `number`, `proto`) and `svcKey` (same). A service is uniquely identified by its port coordinates, so `svcKey` was the same concept under a different name. The duplicate type was deleted; all service map lookups now use `portKey`. A single name for a single concept makes the relationship explicit and eliminates the risk of the two structs diverging in future edits.
+
+### Decoupling — CanFingerprint removes port numbers from main.go
+
+`main.go` previously contained five hardcoded port numbers (80, 443, 8080, 8443, 8888) to gate web technology fingerprinting. Those numbers duplicated the `httpPorts` / `httpsPorts` maps already inside `WebStackFingerprinter`. The wiring layer must not own knowledge about the fingerprinter's internal routing table — that violates the Dependency Inversion Principle.
+
+`CanFingerprint(portNum int) bool` was added to the `WebFingerprinter` interface and implemented on `*WebStackFingerprinter` (returns true when portNum is in either internal map). `main.go` now calls `webFP.CanFingerprint(p.Number)` instead of spelling out the port list. Adding a new web port in the future requires changing one place — the `NewWebStackFingerprinter` constructor — not two.
+
+### Named constants for HTTP client timeouts
+
+Three HTTP client deadlines (30 s for crt.sh, 10 s for HackerTarget, 60 s for Wayback) were promoted from inline literals to named constants (`ctLogTimeout`, `hackerTargetTimeout`, `waybackTimeout`) with explanatory comments. The comments document *why* each timeout is the size it is, which would otherwise be opaque to a reader maintaining the pipeline.
+
+### Silent error discard — documented intent
+
+`doGET` in `WebStackFingerprinter` discards the error returned by `io.ReadAll`. This is intentional: a deadline firing or server-close after the response is the normal HTTP/1.1 termination path when `Connection: close` is set, and the bytes already accumulated are valid for fingerprinting. A comment was added to make the reasoning visible so future readers do not "fix" a deliberate choice.
+
+The User-Agent string (`Mozilla/5.0`) was also extracted as a named constant (`userAgent`) with a comment explaining why a generic browser UA is preferred over a custom scanner string.
+
+### Incorrect CVE comment
+
+The inline comment for CVE-2021-44790 (Apache mod_lua) stated "NULL pointer dereference" but the CVE is a heap buffer overflow. The `Description` field below the comment already said "buffer overflow". The comment was corrected to match both the description and the actual vulnerability class.
+
+### Performance — DB indexes for FindPorts and FindServices
+
+`FindPorts(domain)` and `FindServices(domain)` both execute `WHERE asset_domain = $1`. The composite primary key `(asset_domain, ip, number, proto)` is not useful for a single-column equality predicate in PostgreSQL — the database cannot use the leading-column portion of the composite index to satisfy the WHERE clause without a partial index scan. PostgreSQL also does not automatically create indexes on foreign key columns (unlike primary keys).
+
+Three `CREATE INDEX IF NOT EXISTS` statements were added to the schema:
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_ports_asset_domain    ON ports(asset_domain);
+CREATE INDEX IF NOT EXISTS idx_services_asset_domain ON services(asset_domain);
+CREATE INDEX IF NOT EXISTS idx_buckets_domain        ON bucket_results(domain);
+```
+
+`IF NOT EXISTS` preserves idempotency consistent with the existing `CREATE TABLE IF NOT EXISTS` strategy. For the thesis scale (dozens of assets) the difference is negligible, but the indexes are correct regardless of scale and will matter for Phase 5 benchmarking on larger targets.
+
+### Directory tree — updated to current state
+
+The repository layout diagram was updated to reflect all packages added since the initial writing:
+- `internal/discovery/` now lists all eight files (hackertarget_discoverer, wayback_discoverer, multi_source_discoverer, ptr_enricher, dns_intel added in Phases 1a–1d)
+- `internal/fingerprint/` now lists `web_stack_fingerprinter.go`
+- `internal/analysis/` and `internal/vulndb/` added (missing from earlier versions)
+- `pkg/models/` now shows all three files: `asset.go`, `diff.go`, `vulnerability.go`
+
+### Test additions
+
+- `differ_test.go` — `TestDiffer_DiffAssets_Error`: exercises the `FindAssets()` error path; verifies a nil diff and non-nil error are returned when the reader fails.
+- `differ_test.go` — `TestDiffer_DiffAsset_CombinedPortAndServiceChange`: a single `DiffAsset` call where a new port opens *and* a service version changes in the same scan. Verifies both appear in the result — the critical correctness invariant of the unified DiffAsset signature introduced in the Twelfth Pass.
+- `web_stack_fingerprinter_test.go` — `TestWebStackFingerprinter_CanFingerprint`: table-driven test covering all five HTTP/HTTPS ports (expect true) and three non-web ports (expect false).
 
 ---
 

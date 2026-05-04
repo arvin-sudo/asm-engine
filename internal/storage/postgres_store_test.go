@@ -266,6 +266,44 @@ func TestPostgresStore_FindPorts(t *testing.T) {
 	}
 }
 
+func TestPostgresStore_FindAssetByDomain(t *testing.T) {
+	s := openStore(t)
+	const domain = "integration-test-findbydomain.example.com"
+	t.Cleanup(func() { cleanAsset(t, s, domain) })
+
+	// Domain not in database must return (nil, nil) — not an error.
+	got, err := s.FindAssetByDomain(domain)
+	if err != nil {
+		t.Fatalf("FindAssetByDomain(missing): unexpected error: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("FindAssetByDomain(missing): expected nil record, got %+v", got)
+	}
+
+	// Save an asset and verify the record is returned correctly.
+	asset := models.Asset{Domain: domain, IPs: []string{"10.1.2.3"}}
+	if err := s.SaveAsset(asset); err != nil {
+		t.Fatalf("SaveAsset: %v", err)
+	}
+
+	got, err = s.FindAssetByDomain(domain)
+	if err != nil {
+		t.Fatalf("FindAssetByDomain: %v", err)
+	}
+	if got == nil {
+		t.Fatal("FindAssetByDomain: expected record, got nil")
+	}
+	if got.Domain != domain {
+		t.Errorf("Domain: got %q, want %q", got.Domain, domain)
+	}
+	if len(got.IPs) != 1 || got.IPs[0] != "10.1.2.3" {
+		t.Errorf("IPs: got %v, want [10.1.2.3]", got.IPs)
+	}
+	if got.FirstSeen.IsZero() || got.LastSeen.IsZero() {
+		t.Error("timestamps must not be zero after save")
+	}
+}
+
 func TestPostgresStore_FindServices(t *testing.T) {
 	// Verify that FindServices returns services for a domain, and that a domain
 	// with no services returns an empty result without error.

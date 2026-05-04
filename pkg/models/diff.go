@@ -93,6 +93,25 @@ type ScanDiff struct {
 	ServiceChanges []ServiceChange
 }
 
+// AssetHistory is a pre-scan snapshot of an asset's known ports and services
+// fetched from storage before any current-scan results are written.
+//
+// Differ.LoadAssetHistory populates this struct from the database. Passing the
+// snapshot to Differ.DiffAsset decouples the "when to read" decision from the
+// diff computation itself: the caller controls timing (always before writes),
+// and DiffAsset becomes a pure function with no database access and no error
+// return. This separation is what fixes the service-version diff: reads happen
+// before SaveService, so history reflects the previous scan, not the current one.
+type AssetHistory struct {
+	// Ports holds every open port recorded for this asset in the previous scan.
+	Ports []Port
+
+	// Services holds every identified service recorded for this asset in the
+	// previous scan. The Vulnerabilities field of each Service is always nil —
+	// vulnerability data is not persisted; only name, version, and banner are.
+	Services []Service
+}
+
 // IsEmpty reports whether the diff contains no changes of any kind.
 // Used by main.go to suppress the diff output block when the attack surface
 // is stable.

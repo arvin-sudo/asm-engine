@@ -26,9 +26,9 @@ import (
 // HistoryReader is the read-only subset of storage.Store required by Differ.
 //
 // Narrowing the dependency to just the two query methods means test mocks
-// only need to implement two functions — not the full six-method Store interface.
+// only need to implement two functions — not the full Store interface.
 // storage.PostgresStore satisfies this interface automatically because it
-// implements all six Store methods, which includes these two.
+// implements all Store methods, which includes these three.
 type HistoryReader interface {
 	// FindPorts returns all ports recorded for the given asset domain in the
 	// most recent scan stored in the database.
@@ -54,6 +54,29 @@ type Differ struct {
 // HistoryReader. In tests, pass a mockHistoryReader.
 func NewDiffer(r HistoryReader) *Differ {
 	return &Differ{reader: r}
+}
+
+// LoadAssetHistory fetches the last-known ports and services for domain from
+// the backing store and returns them as a single snapshot.
+//
+// Call this before writing any new scan results for the asset so the returned
+// snapshot reflects the pre-scan database state. This is the correct timing:
+// once SavePort or SaveService has run, the database rows contain the current
+// scan's data and a subsequent FindServices call would compare new vs new —
+// producing no version-change events even when a version did change.
+//
+// The returned *models.AssetHistory is passed directly to DiffAsset, keeping
+// the snapshot lifetime explicit and visible at the call site in main.go.
+func (d *Differ) LoadAssetHistory(domain string) (*models.AssetHistory, error) {
+	ports, err := d.reader.FindPorts(domain)
+	if err != nil {
+		return nil, fmt.Errorf("differ: find ports %q: %w", domain, err)
+	}
+	svcs, err := d.reader.FindServices(domain)
+	if err != nil {
+		return nil, fmt.Errorf("differ: find services %q: %w", domain, err)
+	}
+	return &models.AssetHistory{Ports: ports, Services: svcs}, nil
 }
 
 // DiffAssets compares the current list of live assets against all records in
@@ -87,32 +110,30 @@ func (d *Differ) DiffAssets(current []models.Asset) (*models.ScanDiff, error) {
 	return diff, nil
 }
 
-// DiffAsset compares the current scan results for a single asset domain
-// against its historical state and returns a ScanDiff describing which ports
-// were opened or closed and which service versions changed.
+// DiffAsset compares the current scan results for a single asset domain against
+// the historical snapshot and returns a ScanDiff describing which ports were
+// opened or closed and which service versions changed.
+//
+// This is a pure function: it performs no database reads and returns no error.
+// All historical state comes from history, which must be loaded via
+// LoadAssetHistory before any current-scan results are saved to the database.
 //
 // Rules:
 //   - A port present in current but not in history → ChangePortOpened
 //   - A port present in history but not in current → ChangePortClosed
 //   - A service present in both scans with a different non-empty version → ChangeVersionChange
-func (d *Differ) DiffAsset(domain string, currentPorts []models.Port, currentServices []models.Service) (*models.ScanDiff, error) {
-	histPorts, err := d.reader.FindPorts(domain)
-	if err != nil {
-		return nil, fmt.Errorf("differ: find ports for %q: %w", domain, err)
-	}
-	histServices, err := d.reader.FindServices(domain)
-	if err != nil {
-		return nil, fmt.Errorf("differ: find services for %q: %w", domain, err)
-	}
-
+func (d *Differ) DiffAsset(domain string, history *models.AssetHistory, currentPorts []models.Port, currentServices []models.Service) *models.ScanDiff {
 	diff := &models.ScanDiff{Domain: domain}
 
-	// --- Port diff ---
 	// portKey uniquely identifies a port across IPs within one asset.
-	type portKey struct{ ip string; number int; proto string }
+	type portKey struct {
+		ip     string
+		number int
+		proto  string
+	}
 
-	histPortSet := make(map[portKey]struct{}, len(histPorts))
-	for _, p := range histPorts {
+	histPortSet := make(map[portKey]struct{}, len(history.Ports))
+	for _, p := range history.Ports {
 		histPortSet[portKey{p.IP, p.Number, p.Proto}] = struct{}{}
 	}
 
@@ -130,7 +151,7 @@ func (d *Differ) DiffAsset(domain string, currentPorts []models.Port, currentSer
 		}
 	}
 
-	for _, p := range histPorts {
+	for _, p := range history.Ports {
 		if _, ok := currPortSet[portKey{p.IP, p.Number, p.Proto}]; !ok {
 			diff.PortChanges = append(diff.PortChanges, models.PortChange{
 				Port: p,
@@ -141,14 +162,15 @@ func (d *Differ) DiffAsset(domain string, currentPorts []models.Port, currentSer
 
 	// --- Service version diff ---
 	// Build a map of historical services keyed by (ip, port number, proto).
-	type svcKey struct{ ip string; number int; proto string }
-	histSvcMap := make(map[svcKey]models.Service, len(histServices))
-	for _, s := range histServices {
-		histSvcMap[svcKey{s.Port.IP, s.Port.Number, s.Port.Proto}] = s
+	// portKey is reused here: a service is uniquely located by its port
+	// coordinates, so the same identity struct covers both lookups.
+	histSvcMap := make(map[portKey]models.Service, len(history.Services))
+	for _, s := range history.Services {
+		histSvcMap[portKey{s.Port.IP, s.Port.Number, s.Port.Proto}] = s
 	}
 
 	for _, curr := range currentServices {
-		hist, ok := histSvcMap[svcKey{curr.Port.IP, curr.Port.Number, curr.Port.Proto}]
+		hist, ok := histSvcMap[portKey{curr.Port.IP, curr.Port.Number, curr.Port.Proto}]
 		if !ok {
 			// New service on a newly-opened port — already covered by PortChange.
 			continue
@@ -167,5 +189,5 @@ func (d *Differ) DiffAsset(domain string, currentPorts []models.Port, currentSer
 		}
 	}
 
-	return diff, nil
+	return diff
 }

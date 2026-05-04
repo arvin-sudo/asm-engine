@@ -269,3 +269,28 @@ func TestWebStackFingerprinter_UnreachablePort(t *testing.T) {
 		t.Fatal("FingerprintWeb() expected error for unreachable port, got nil")
 	}
 }
+
+func TestWebStackFingerprinter_CanFingerprint(t *testing.T) {
+	tests := []struct {
+		port int
+		want bool
+	}{
+		{80, true},    // standard HTTP
+		{443, true},   // standard HTTPS
+		{8080, true},  // alternate HTTP
+		{8443, true},  // alternate HTTPS
+		{8888, true},  // alternate HTTP
+		{22, false},   // SSH — not an HTTP port
+		{3306, false}, // MySQL — not an HTTP port
+		{5432, false}, // PostgreSQL — not an HTTP port
+		{0, false},    // invalid — not in any routing table
+	}
+
+	f := NewWebStackFingerprinter(time.Second)
+	for _, tt := range tests {
+		got := f.CanFingerprint(tt.port)
+		if got != tt.want {
+			t.Errorf("CanFingerprint(%d) = %v, want %v", tt.port, got, tt.want)
+		}
+	}
+}

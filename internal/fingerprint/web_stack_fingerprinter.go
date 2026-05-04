@@ -22,6 +22,15 @@ import (
 // inline styles, while bounding memory use on large pages.
 const webReadLimit = 8192
 
+// userAgent is the HTTP User-Agent header sent with every GET request.
+//
+// A minimal generic desktop browser string is used rather than a custom tool
+// identifier. Many production servers apply bot-detection that returns a
+// non-representative response (a CAPTCHA page or a redirect) when they see an
+// unfamiliar UA. Sending a plausible browser string avoids that filter so the
+// body we receive for fingerprinting reflects what a real user would see.
+const userAgent = "Mozilla/5.0"
+
 // headerRule maps a response header name to a technology signature.
 type headerRule struct {
 	header   string // canonical HTTP header name (Title-Cased)
@@ -195,6 +204,17 @@ func (f *WebStackFingerprinter) FingerprintWeb(domain string, port models.Port) 
 	return detectTechnologies(respHeaders, body), nil
 }
 
+// CanFingerprint reports whether portNum is in this fingerprinter's HTTP or
+// HTTPS routing table. Returns true for the standard web ports (80, 8080, 8888
+// for HTTP; 443, 8443 for HTTPS) that were registered in NewWebStackFingerprinter.
+//
+// main.go uses this to gate web fingerprinting without embedding port numbers
+// in the wiring layer — the fingerprinter owns authoritative knowledge of which
+// ports speak HTTP.
+func (f *WebStackFingerprinter) CanFingerprint(portNum int) bool {
+	return f.httpPorts[portNum] || f.httpsPorts[portNum]
+}
+
 // fetchHTTP dials port over plain TCP, sends a GET / with the domain Host
 // header, and returns the response headers and body (capped at webReadLimit).
 func (f *WebStackFingerprinter) fetchHTTP(domain string, port models.Port) (string, http.Header, error) {
@@ -235,13 +255,19 @@ func (f *WebStackFingerprinter) doGET(conn net.Conn, domain string, port models.
 	// This encourages HTTP/1.1 servers to close after the response, terminating
 	// the read loop without requiring chunk-encoding or Content-Length parsing.
 	req := fmt.Sprintf(
-		"GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: Mozilla/5.0\r\n\r\n",
-		domain,
+		"GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: %s\r\n\r\n",
+		domain, userAgent,
 	)
 	if _, err := conn.Write([]byte(req)); err != nil {
 		return "", nil, err
 	}
 
+	// The error from ReadAll is intentionally discarded. On a plain TCP
+	// connection, io.ReadAll returns an error when the read deadline fires or
+	// when the server closes the connection after sending its response — both
+	// are the expected termination path for an HTTP/1.1 request with
+	// "Connection: close". The bytes accumulated before the error contain the
+	// complete response and are valid for fingerprinting regardless.
 	raw, _ := io.ReadAll(io.LimitReader(conn, int64(webReadLimit)))
 	return parseHTTPResponse(string(raw))
 }

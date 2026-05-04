@@ -2,6 +2,7 @@ package storage
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -70,6 +71,17 @@ CREATE TABLE IF NOT EXISTS bucket_results (
     first_seen TIMESTAMPTZ NOT NULL,
     last_seen  TIMESTAMPTZ NOT NULL
 );
+
+-- Performance: FindPorts and FindServices filter by asset_domain alone, but the
+-- composite primary key (asset_domain, ip, number, proto) does not satisfy a
+-- single-column equality predicate efficiently. Without a dedicated index each
+-- call performs a sequential scan of the full table.
+CREATE INDEX IF NOT EXISTS idx_ports_asset_domain    ON ports(asset_domain);
+CREATE INDEX IF NOT EXISTS idx_services_asset_domain ON services(asset_domain);
+
+-- Performance: bucket queries group results by domain; an index avoids scanning
+-- all bucket rows when fetching findings for a specific target.
+CREATE INDEX IF NOT EXISTS idx_buckets_domain        ON bucket_results(domain);
 `
 
 // PostgresStore implements Store by persisting all ASM findings to a
@@ -281,6 +293,32 @@ func (s *PostgresStore) FindServices(domain string) ([]models.Service, error) {
 		return nil, fmt.Errorf("find_services rows: %w", err)
 	}
 	return svcs, nil
+}
+
+// FindAssetByDomain returns the persisted record for a single domain, or
+// (nil, nil) if the domain has never been saved. Unlike FindAssets, this
+// performs a targeted single-row lookup — efficient when the caller already
+// knows which domain it needs without loading the full asset table.
+func (s *PostgresStore) FindAssetByDomain(domain string) (*models.AssetRecord, error) {
+	row := s.db.QueryRow(`
+		SELECT domain, ips, first_seen, last_seen
+		FROM   assets
+		WHERE  domain = $1
+	`, domain)
+
+	var r models.AssetRecord
+	var ips pq.StringArray
+	if err := row.Scan(&r.Domain, &ips, &r.FirstSeen, &r.LastSeen); err != nil {
+		// sql.ErrNoRows is not an error condition — the domain simply has not
+		// been seen before. Return (nil, nil) so callers can distinguish
+		// "not found" from a real database failure without inspecting errors.
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("find_asset_by_domain %q: %w", domain, err)
+	}
+	r.IPs = []string(ips)
+	return &r, nil
 }
 
 // FindAssets returns every persisted asset together with its first-seen and

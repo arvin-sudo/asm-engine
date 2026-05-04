@@ -59,6 +59,13 @@ type Store interface {
 	// may have disappeared from the attack surface since the last scan.
 	FindAssets() ([]models.AssetRecord, error)
 
+	// FindAssetByDomain returns the persisted record for a single asset domain,
+	// including its first-seen and last-seen timestamps. Returns (nil, nil)
+	// when the domain is not found — not an error condition. Unlike FindAssets,
+	// this performs a single-row lookup, making it efficient for targeted
+	// queries when the caller already knows which domain it needs.
+	FindAssetByDomain(domain string) (*models.AssetRecord, error)
+
 	// FindPorts returns all ports previously observed for the given asset domain,
 	// ordered by ip then port number. Used by the differential analyser to
 	// compare the current scan's open ports against the last known state.

@@ -1,6 +1,7 @@
 package analysis
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/arvin-sudo/asm-engine/pkg/models"
@@ -35,9 +36,9 @@ func (m *mockHistoryReader) FindServices(domain string) ([]models.Service, error
 
 func TestDiffer_DiffAssets(t *testing.T) {
 	tests := []struct {
-		name        string
-		historical  []models.AssetRecord
-		current     []models.Asset
+		name           string
+		historical     []models.AssetRecord
+		current        []models.Asset
 		wantNewDomains []string
 	}{
 		{
@@ -107,11 +108,11 @@ func TestDiffer_DiffAsset_Ports(t *testing.T) {
 	tcp5432 := models.Port{IP: "1.2.3.4", Number: 5432, Proto: "tcp"}
 
 	tests := []struct {
-		name         string
-		histPorts    []models.Port
-		currPorts    []models.Port
-		wantOpened   []models.Port
-		wantClosed   []models.Port
+		name       string
+		histPorts  []models.Port
+		currPorts  []models.Port
+		wantOpened []models.Port
+		wantClosed []models.Port
 	}{
 		{
 			name:       "no history means all ports are opened",
@@ -131,9 +132,9 @@ func TestDiffer_DiffAsset_Ports(t *testing.T) {
 			wantOpened: []models.Port{tcp5432},
 		},
 		{
-			name:      "port closed since last scan",
-			histPorts: []models.Port{tcp80, tcp443},
-			currPorts: []models.Port{tcp80},
+			name:       "port closed since last scan",
+			histPorts:  []models.Port{tcp80, tcp443},
+			currPorts:  []models.Port{tcp80},
 			wantClosed: []models.Port{tcp443},
 		},
 		{
@@ -143,20 +144,21 @@ func TestDiffer_DiffAsset_Ports(t *testing.T) {
 			wantOpened: []models.Port{tcp443},
 			wantClosed: []models.Port{tcp80},
 		},
+		{
+			name:       "all ports closed — history had ports, current is empty",
+			histPorts:  []models.Port{tcp80, tcp443},
+			currPorts:  nil,
+			wantClosed: []models.Port{tcp80, tcp443},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			reader := &mockHistoryReader{
-				ports:    map[string][]models.Port{"example.com": tt.histPorts},
-				services: map[string][]models.Service{},
-			}
-			d := NewDiffer(reader)
+			// DiffAsset is pure — no reader calls. Use an empty mock for safety.
+			d := NewDiffer(&mockHistoryReader{})
+			history := &models.AssetHistory{Ports: tt.histPorts}
 
-			diff, err := d.DiffAsset("example.com", tt.currPorts, nil)
-			if err != nil {
-				t.Fatalf("DiffAsset() error = %v", err)
-			}
+			diff := d.DiffAsset("example.com", history, tt.currPorts, nil)
 
 			var opened, closed []models.Port
 			for _, c := range diff.PortChanges {
@@ -250,16 +252,11 @@ func TestDiffer_DiffAsset_ServiceVersionChange(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			reader := &mockHistoryReader{
-				ports:    map[string][]models.Port{},
-				services: map[string][]models.Service{"example.com": tt.histServices},
-			}
-			d := NewDiffer(reader)
+			// DiffAsset is pure — no reader calls. Use an empty mock for safety.
+			d := NewDiffer(&mockHistoryReader{})
+			history := &models.AssetHistory{Services: tt.histServices}
 
-			diff, err := d.DiffAsset("example.com", nil, tt.currServices)
-			if err != nil {
-				t.Fatalf("DiffAsset() error = %v", err)
-			}
+			diff := d.DiffAsset("example.com", history, nil, tt.currServices)
 
 			if len(diff.ServiceChanges) != tt.wantChanges {
 				t.Fatalf("ServiceChanges: got %d, want %d — changes: %v",
@@ -273,6 +270,123 @@ func TestDiffer_DiffAsset_ServiceVersionChange(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDiffer_LoadAssetHistory(t *testing.T) {
+	tcp80 := models.Port{IP: "1.2.3.4", Number: 80, Proto: "tcp"}
+	svc := models.Service{Port: tcp80, Name: "nginx", Version: "1.18.0"}
+
+	tests := []struct {
+		name            string
+		domain          string
+		readerPorts     []models.Port
+		readerServices  []models.Service
+		readerErr       error
+		wantErr         bool
+		wantPortCount   int
+		wantServiceCount int
+	}{
+		{
+			name:             "returns ports and services for domain",
+			domain:           "example.com",
+			readerPorts:      []models.Port{tcp80},
+			readerServices:   []models.Service{svc},
+			wantPortCount:    1,
+			wantServiceCount: 1,
+		},
+		{
+			name:      "reader error is propagated",
+			domain:    "example.com",
+			readerErr: errors.New("db down"),
+			wantErr:   true,
+		},
+		{
+			name:             "empty history for unknown domain",
+			domain:           "unknown.example.com",
+			wantPortCount:    0,
+			wantServiceCount: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reader := &mockHistoryReader{
+				ports:    map[string][]models.Port{tt.domain: tt.readerPorts},
+				services: map[string][]models.Service{tt.domain: tt.readerServices},
+				err:      tt.readerErr,
+			}
+			d := NewDiffer(reader)
+
+			history, err := d.LoadAssetHistory(tt.domain)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("LoadAssetHistory() expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("LoadAssetHistory() unexpected error: %v", err)
+			}
+			if len(history.Ports) != tt.wantPortCount {
+				t.Errorf("Ports: got %d, want %d", len(history.Ports), tt.wantPortCount)
+			}
+			if len(history.Services) != tt.wantServiceCount {
+				t.Errorf("Services: got %d, want %d", len(history.Services), tt.wantServiceCount)
+			}
+		})
+	}
+}
+
+func TestDiffer_DiffAssets_Error(t *testing.T) {
+	reader := &mockHistoryReader{err: errors.New("db unavailable")}
+	d := NewDiffer(reader)
+
+	diff, err := d.DiffAssets([]models.Asset{{Domain: "api.example.com"}})
+	if err == nil {
+		t.Fatal("DiffAssets() expected error when reader fails, got nil")
+	}
+	if diff != nil {
+		t.Errorf("DiffAssets() expected nil diff on reader error, got %v", diff)
+	}
+}
+
+func TestDiffer_DiffAsset_CombinedPortAndServiceChange(t *testing.T) {
+	port80 := models.Port{IP: "1.2.3.4", Number: 80, Proto: "tcp"}
+	port443 := models.Port{IP: "1.2.3.4", Number: 443, Proto: "tcp"}
+
+	// History: only port 443, nginx 1.18.0.
+	history := &models.AssetHistory{
+		Ports: []models.Port{port443},
+		Services: []models.Service{
+			{Port: port443, Name: "nginx", Version: "1.18.0"},
+		},
+	}
+	// Current: port 443 (nginx upgraded) + port 80 (newly opened).
+	currentPorts := []models.Port{port443, port80}
+	currentServices := []models.Service{
+		{Port: port443, Name: "nginx", Version: "1.24.0"},
+	}
+
+	d := NewDiffer(&mockHistoryReader{})
+	diff := d.DiffAsset("example.com", history, currentPorts, currentServices)
+
+	if len(diff.PortChanges) != 1 {
+		t.Fatalf("PortChanges: got %d, want 1 — %v", len(diff.PortChanges), diff.PortChanges)
+	}
+	if diff.PortChanges[0].Kind != models.ChangePortOpened {
+		t.Errorf("PortChange kind: got %q, want %q", diff.PortChanges[0].Kind, models.ChangePortOpened)
+	}
+	if diff.PortChanges[0].Port.Number != 80 {
+		t.Errorf("opened port number: got %d, want 80", diff.PortChanges[0].Port.Number)
+	}
+
+	if len(diff.ServiceChanges) != 1 {
+		t.Fatalf("ServiceChanges: got %d, want 1 — %v", len(diff.ServiceChanges), diff.ServiceChanges)
+	}
+	sc := diff.ServiceChanges[0]
+	if sc.OldVersion != "1.18.0" || sc.NewVersion != "1.24.0" {
+		t.Errorf("version change: got %q→%q, want 1.18.0→1.24.0", sc.OldVersion, sc.NewVersion)
 	}
 }
 

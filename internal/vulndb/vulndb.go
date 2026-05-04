@@ -9,52 +9,24 @@
 // runtime beyond the network itself. A JSON file adds file-system I/O, error
 // handling, a new flag, and a deployment artefact. The hardcoded map is a
 // single Go file — trivially auditable, trivially updatable, always available.
-// When the CVE list grows large enough to justify a database, the VulnerabilityChecker
-// interface makes swapping the implementation a one-line change in main.go.
+// When the CVE list grows large enough to justify a database, the
+// VulnerabilityChecker interface makes swapping the implementation a one-line
+// change in main.go.
+//
+// Why does this package import pkg/models rather than define its own types?
+// models.Vulnerability must be assignable to models.Service.Vulnerabilities,
+// and pkg/models cannot import internal packages. Defining the type here and
+// also in models would create two incompatible types for the same concept.
+// The solution is to own the type in models (the shared vocabulary layer) and
+// have this package import it — a legitimate dependency direction.
 package vulndb
 
 import (
 	"strconv"
 	"strings"
+
+	"github.com/arvin-sudo/asm-engine/pkg/models"
 )
-
-// Severity expresses the risk level of a vulnerability using the industry-
-// standard four-tier model. The value is printed verbatim in the scan output
-// so the string representation is user-facing.
-type Severity string
-
-const (
-	// Critical vulnerabilities allow unauthenticated remote code execution or
-	// equivalent full-system compromise with no user interaction required.
-	Critical Severity = "CRITICAL"
-
-	// High vulnerabilities allow significant privilege escalation, data
-	// exfiltration, or denial of service with limited preconditions.
-	High Severity = "HIGH"
-
-	// Medium vulnerabilities allow partial information disclosure or require
-	// authenticated access to exploit.
-	Medium Severity = "MEDIUM"
-
-	// Low vulnerabilities represent minor information leakage or hardening
-	// recommendations with no direct exploitability.
-	Low Severity = "LOW"
-)
-
-// Vulnerability describes a single known CVE that affects a specific version
-// range of a named service.
-type Vulnerability struct {
-	// CVE is the canonical vulnerability identifier (e.g. "CVE-2024-6387").
-	// An empty CVE field is valid for generic security notes (e.g. plain HTTP).
-	CVE string
-
-	// Severity is the risk classification.
-	Severity Severity
-
-	// Description is a one-line human-readable summary suitable for printing
-	// in the scan output beneath the affected service line.
-	Description string
-}
 
 // VulnerabilityChecker is the interface consumed by cmd/asm/main.go.
 //
@@ -62,10 +34,10 @@ type Vulnerability struct {
 // implementation — tests can inject a stub that returns pre-canned results
 // without loading the full CVE dataset.
 type VulnerabilityChecker interface {
-	// Check returns all known vulnerabilities for the given lowercase service
-	// name and version string. Returns nil when no vulnerabilities are known,
-	// when name is unrecognised, or when version is empty (no version to compare).
-	Check(name, version string) []Vulnerability
+	// Check returns all known vulnerabilities for the given service name and
+	// version string. Returns nil when no vulnerabilities are known, when name
+	// is unrecognised, or when version is empty and the rule requires a version.
+	Check(name, version string) []models.Vulnerability
 }
 
 // vulnRule defines a version range for a single CVE.
@@ -78,7 +50,7 @@ type vulnRule struct {
 	// by the fingerprinter must be ≤ maxVersion for the rule to fire.
 	maxVersion string
 
-	vuln Vulnerability
+	vuln models.Vulnerability
 }
 
 // VulnDB implements VulnerabilityChecker against a hardcoded CVE dataset.
@@ -91,7 +63,7 @@ type vulnRule struct {
 // fingerprints.
 type VulnDB struct {
 	// rules maps lowercase service names to their vulnerability rules.
-	// The service name must match the Name field produced by parseServiceBanner.
+	// The service name must match the Name field produced by the fingerprinter.
 	rules map[string][]vulnRule
 }
 
@@ -117,9 +89,9 @@ func (v *VulnDB) load() {
 		// glibc-based Linux systems. Patched in 9.8p1.
 		minVersion: "8.5p1",
 		maxVersion: "9.7p1",
-		vuln: Vulnerability{
+		vuln: models.Vulnerability{
 			CVE:      "CVE-2024-6387",
-			Severity: Critical,
+			Severity: models.Critical,
 			Description: "regreSSHion — unauthenticated RCE via signal handler race " +
 				"in sshd (affects 8.5p1–9.7p1, patched in 9.8p1)",
 		},
@@ -128,9 +100,9 @@ func (v *VulnDB) load() {
 		// Username enumeration: timing side-channel in the authentication
 		// failure path leaks whether an account exists.
 		maxVersion: "7.6",
-		vuln: Vulnerability{
+		vuln: models.Vulnerability{
 			CVE:         "CVE-2018-15473",
-			Severity:    Medium,
+			Severity:    models.Medium,
 			Description: "username enumeration via timing side-channel in authentication failure path",
 		},
 	})
@@ -142,19 +114,19 @@ func (v *VulnDB) load() {
 		// Only affects 2.4.49. A variant (CVE-2021-42013) extends to 2.4.50.
 		minVersion: "2.4.49",
 		maxVersion: "2.4.50",
-		vuln: Vulnerability{
+		vuln: models.Vulnerability{
 			CVE:         "CVE-2021-41773",
-			Severity:    Critical,
+			Severity:    models.Critical,
 			Description: "path traversal + unauthenticated RCE via %2e%2e%2f sequences (2.4.49–2.4.50 only)",
 		},
 	})
 	v.add("apache", vulnRule{
-		// NULL pointer dereference: mod_lua allows a crafted request to crash
-		// the worker process. Affects all 2.4.x before 2.4.52.
+		// Buffer overflow: a crafted request body triggers a heap buffer overflow
+		// in mod_lua, crashing the worker process. Affects all 2.4.x before 2.4.52.
 		maxVersion: "2.4.51",
-		vuln: Vulnerability{
+		vuln: models.Vulnerability{
 			CVE:         "CVE-2021-44790",
-			Severity:    High,
+			Severity:    models.High,
 			Description: "mod_lua buffer overflow via crafted request body (pre-2.4.52)",
 		},
 	})
@@ -165,9 +137,9 @@ func (v *VulnDB) load() {
 		// response can corrupt one byte of heap memory. Exploitable for code
 		// execution in specific configurations.
 		maxVersion: "1.20.0",
-		vuln: Vulnerability{
+		vuln: models.Vulnerability{
 			CVE:         "CVE-2021-23017",
-			Severity:    High,
+			Severity:    models.High,
 			Description: "off-by-one write in DNS resolver via crafted CNAME response (pre-1.20.1)",
 		},
 	})
@@ -179,9 +151,9 @@ func (v *VulnDB) load() {
 		// Affects Postfix < 3.5.23, 3.6.x < 3.6.17, 3.7.x < 3.7.17, etc.
 		// Reported version from the fingerprinter is the Postfix version.
 		maxVersion: "3.5.22",
-		vuln: Vulnerability{
+		vuln: models.Vulnerability{
 			CVE:         "CVE-2023-51764",
-			Severity:    High,
+			Severity:    models.High,
 			Description: "SMTP smuggling allows spoofed email from trusted domains (Postfix < 3.5.23)",
 		},
 	})
@@ -192,9 +164,9 @@ func (v *VulnDB) load() {
 		// downgrading negotiated algorithms. ProFTPD uses embedded SSH-like
 		// mechanisms in SFTP mode — older builds share the vulnerability.
 		maxVersion: "1.3.7",
-		vuln: Vulnerability{
+		vuln: models.Vulnerability{
 			CVE:         "CVE-2023-48795",
-			Severity:    High,
+			Severity:    models.High,
 			Description: "Terrapin SSH prefix truncation attack affects SFTP mode (pre-1.3.8)",
 		},
 	})
@@ -206,17 +178,17 @@ func (v *VulnDB) load() {
 	// precise version checks.
 	v.add("imap", vulnRule{
 		maxVersion: "",
-		vuln: Vulnerability{
+		vuln: models.Vulnerability{
 			CVE:         "CVE-2024-23184",
-			Severity:    High,
+			Severity:    models.High,
 			Description: "excessive resource allocation via malformed address headers in Dovecot (pre-2.3.21)",
 		},
 	})
 	v.add("pop3", vulnRule{
 		maxVersion: "",
-		vuln: Vulnerability{
+		vuln: models.Vulnerability{
 			CVE:         "CVE-2024-23184",
-			Severity:    High,
+			Severity:    models.High,
 			Description: "excessive resource allocation via malformed address headers in Dovecot (pre-2.3.21)",
 		},
 	})
@@ -226,9 +198,9 @@ func (v *VulnDB) load() {
 		// Not a CVE — a configuration note. Plain HTTP transmits credentials and
 		// session tokens in clear text; any network observer can intercept them.
 		maxVersion: "",
-		vuln: Vulnerability{
+		vuln: models.Vulnerability{
 			CVE:      "",
-			Severity: Low,
+			Severity: models.Low,
 			Description: "plain HTTP — credentials and session tokens transmitted in clear text; " +
 				"consider enforcing HTTPS",
 		},
@@ -247,13 +219,13 @@ func (v *VulnDB) add(service string, r vulnRule) {
 // Version comparison is performed with compareVersions, which handles both
 // dotted-decimal (nginx "1.18.0", Apache "2.4.41") and OpenSSH-style
 // "major.minor.patchpN" strings.
-func (v *VulnDB) Check(name, version string) []Vulnerability {
+func (v *VulnDB) Check(name, version string) []models.Vulnerability {
 	rules, ok := v.rules[strings.ToLower(name)]
 	if !ok {
 		return nil
 	}
 
-	var matches []Vulnerability
+	var matches []models.Vulnerability
 	for _, r := range rules {
 		// When maxVersion is empty the rule is an unconditional note — it fires
 		// regardless of version (used for IMAP/POP3/HTTP informational entries).

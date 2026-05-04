@@ -63,4 +63,10 @@ type WebFingerprinter interface {
 	// known technology signatures are detected. Returns an error only when the
 	// TCP connection or TLS handshake fails.
 	FingerprintWeb(domain string, port models.Port) ([]models.Technology, error)
+
+	// CanFingerprint reports whether portNum falls within this fingerprinter's
+	// HTTP or HTTPS port routing table. Callers use this to gate web
+	// fingerprinting without duplicating port lists in the wiring layer —
+	// the fingerprinter owns knowledge of which ports speak HTTP.
+	CanFingerprint(portNum int) bool
 }

@@ -113,6 +113,14 @@ type Service struct {
 	// Storing the raw banner lets analysts apply custom detection signatures
 	// after the fact, without needing to re-scan the target.
 	Banner string
+
+	// Vulnerabilities holds CVEs matched against this service's name and
+	// version by the vulnerability database during the current scan run.
+	// This field is populated in-memory and is never persisted — CVE
+	// applicability is recomputed fresh on every run from the built-in
+	// dataset, ensuring results always reflect the current state of the
+	// vulnerability database rather than a stale snapshot from a past scan.
+	Vulnerabilities []Vulnerability
 }
 
 // BucketResult is a cloud storage bucket probed during Phase 3 (cloud bucket hunting).

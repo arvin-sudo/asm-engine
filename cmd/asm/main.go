@@ -43,9 +43,13 @@ var defaultPorts = []int{
 }
 
 // webServiceNames is the set of service names for which web technology
-// fingerprinting is attempted. Only services that speak HTTP benefit from a
-// full GET request; running it against SSH or a database port wastes a
-// round-trip and produces no useful output.
+// fingerprinting is attempted. This handles the service-name routing path:
+// when banner fingerprinting identifies a service as nginx/apache/etc. on a
+// non-standard port, this map ensures FingerprintWeb is still called.
+//
+// Standard-port routing (80, 443, 8080, 8443, 8888) is handled separately by
+// WebFingerprinter.CanFingerprint — the fingerprinter owns that knowledge so
+// main.go does not need to hardcode port numbers.
 var webServiceNames = map[string]bool{
 	"http":   true,
 	"https":  true,
@@ -53,6 +57,27 @@ var webServiceNames = map[string]bool{
 	"apache": true,
 	"iis":    true,
 }
+
+const (
+	// ctLogTimeout is the HTTP client deadline for crt.sh CT log queries.
+	// crt.sh aggregates hundreds of certificate transparency logs and can take
+	// 20–25 seconds for large organisations with extensive certificate histories.
+	// 30 seconds provides a comfortable margin without stalling the pipeline.
+	ctLogTimeout = 30 * time.Second
+
+	// hackerTargetTimeout is the HTTP client deadline for HackerTarget passive DNS.
+	// HackerTarget returns plain text with no server-side aggregation — typical
+	// responses arrive in under 2 seconds. 10 seconds is deliberately generous
+	// to absorb transient latency spikes without causing false failures.
+	hackerTargetTimeout = 10 * time.Second
+
+	// waybackTimeout is the HTTP client deadline for the Wayback Machine CDX API.
+	// The CDX index can return up to 10,000 URL records for popular domains.
+	// Serialising that payload over a variable-latency connection requires a
+	// longer window than the HackerTarget endpoint; 60 seconds prevents premature
+	// cutoff on large targets.
+	waybackTimeout = 60 * time.Second
+)
 
 // main is the CLI entry point.
 //
@@ -140,9 +165,9 @@ func main() {
 	// Results are merged and deduplicated; the first source that reports a
 	// hostname wins the Source tag for coverage analysis in Phase 5.
 	var subdiscoverer discovery.SubdomainDiscoverer = discovery.NewMultiSourceDiscoverer(
-		discovery.NewCTDiscoverer(&http.Client{Timeout: 30 * time.Second}),
-		discovery.NewHackerTargetDiscoverer(&http.Client{Timeout: 10 * time.Second}),
-		discovery.NewWayBackDiscoverer(&http.Client{Timeout: 60 * time.Second}),
+		discovery.NewCTDiscoverer(&http.Client{Timeout: ctLogTimeout}),
+		discovery.NewHackerTargetDiscoverer(&http.Client{Timeout: hackerTargetTimeout}),
+		discovery.NewWayBackDiscoverer(&http.Client{Timeout: waybackTimeout}),
 	)
 
 	fmt.Printf("Phase 1a: passive recon for %s (CT logs, HackerTarget, WayBack)...\n\n", domain)
@@ -327,8 +352,8 @@ func main() {
 		}
 
 		totalOpen := 0
-		// perAssetDiffs accumulates per-asset port/service diffs for the
-		// summary printed after all Phase 2 output.
+		// allDiffs accumulates per-asset port/service diffs for the summary
+		// printed after all Phase 2 output.
 		var allDiffs []*models.ScanDiff
 
 		for _, asset := range liveAssets {
@@ -337,8 +362,32 @@ func main() {
 				fmt.Printf("  [scan error] %s: %v\n\n", asset.Domain, err)
 				continue
 			}
+
+			// Load the pre-scan DB snapshot BEFORE any writes for this asset.
+			// DiffAsset compares against this snapshot, so it must reflect the
+			// state from the previous scan run — not the rows we are about to
+			// write. Loading after SavePort or SaveService would cause the diff
+			// to compare new vs new, silently dropping all version-change events.
+			var history *models.AssetHistory
+			if differ != nil {
+				h, histErr := differ.LoadAssetHistory(asset.Domain)
+				if histErr != nil {
+					log.Printf("diff: load history %q: %v", asset.Domain, histErr)
+				} else {
+					history = h
+				}
+			}
+
 			if len(openPorts) == 0 {
 				fmt.Printf("  %s — no open ports found\n\n", asset.Domain)
+				// Still run the diff: if the previous scan recorded open ports
+				// and now none are found, those ports must be reported as closed.
+				if differ != nil && history != nil {
+					diff := differ.DiffAsset(asset.Domain, history, nil, nil)
+					if !diff.IsEmpty() {
+						allDiffs = append(allDiffs, diff)
+					}
+				}
 				continue
 			}
 
@@ -350,17 +399,6 @@ func main() {
 				}
 				return openPorts[i].Number < openPorts[j].Number
 			})
-
-			// Compute the port/service diff BEFORE saving new results.
-			// SavePort and SaveService update the DB rows; reading history after
-			// the save would always return "no change".
-			var portDiff *models.ScanDiff
-			if differ != nil {
-				portDiff, err = differ.DiffAsset(asset.Domain, openPorts, nil)
-				if err != nil {
-					log.Printf("diff: ports for %q: %v", asset.Domain, err)
-				}
-			}
 
 			fmt.Printf("  %s\n", asset.Domain)
 			var scannedServices []models.Service
@@ -387,6 +425,14 @@ func main() {
 						fmt.Printf("      %d/tcp   open\n", p.Number)
 						continue
 					}
+
+					// Annotate the service with matching CVEs before saving or
+					// printing. The result is stored on the struct so the
+					// complete service picture (identity + known CVEs) travels
+					// together through the pipeline. Vulnerabilities are never
+					// persisted — they are recomputed from the built-in dataset
+					// on every run, so stored vulns would only go stale.
+					svc.Vulnerabilities = vulnChecker.Check(svc.Name, svc.Version)
 
 					// Persist whenever there is something meaningful to store.
 					// A service with no recognised name may still carry a raw banner
@@ -415,25 +461,22 @@ func main() {
 						fmt.Printf("      %d/tcp   %s\n", p.Number, svc.Name)
 					}
 
-					// Vulnerability check: annotate identified services with
-					// known CVEs immediately below the service line.
-					if vulns := vulnChecker.Check(svc.Name, svc.Version); len(vulns) > 0 {
-						for _, v := range vulns {
-							if v.CVE != "" {
-								fmt.Printf("               [%s %s: %s]\n",
-									v.Severity, v.CVE, v.Description)
-							} else {
-								fmt.Printf("               [%s: %s]\n",
-									v.Severity, v.Description)
-							}
+					// Print CVEs from the annotated service struct — no second
+					// Check call needed; the results are already on svc.
+					for _, v := range svc.Vulnerabilities {
+						if v.CVE != "" {
+							fmt.Printf("               [%s %s: %s]\n",
+								v.Severity, v.CVE, v.Description)
+						} else {
+							fmt.Printf("               [%s: %s]\n",
+								v.Severity, v.Description)
 						}
 					}
 
 					// Technology stack fingerprinting: run a full GET on HTTP/HTTPS
 					// ports to detect CMSes, frameworks, and languages that the
 					// Server header does not expose.
-					if webServiceNames[svc.Name] || p.Number == 80 || p.Number == 443 ||
-						p.Number == 8080 || p.Number == 8443 || p.Number == 8888 {
+					if webServiceNames[svc.Name] || webFP.CanFingerprint(p.Number) {
 						techs, err := webFP.FingerprintWeb(asset.Domain, p)
 						if err == nil && len(techs) > 0 {
 							var techNames []string
@@ -451,17 +494,15 @@ func main() {
 			}
 			fmt.Println()
 
-			// Now compute the service version diff using the collected services.
-			if differ != nil && portDiff != nil {
-				svcDiff, err := differ.DiffAsset(asset.Domain, nil, scannedServices)
-				if err != nil {
-					log.Printf("diff: services for %q: %v", asset.Domain, err)
-				} else {
-					// Merge service changes into the port diff result.
-					portDiff.ServiceChanges = append(portDiff.ServiceChanges, svcDiff.ServiceChanges...)
-				}
-				if !portDiff.IsEmpty() {
-					allDiffs = append(allDiffs, portDiff)
+			// Compute port and service diffs in a single call using the
+			// pre-scan snapshot. Both ports and services are compared here
+			// rather than in two separate calls — this is what makes service
+			// version detection correct: history was read before SaveService
+			// ran, so hist.Version holds the previous scan's value.
+			if differ != nil && history != nil {
+				diff := differ.DiffAsset(asset.Domain, history, openPorts, scannedServices)
+				if !diff.IsEmpty() {
+					allDiffs = append(allDiffs, diff)
 				}
 			}
 		}
