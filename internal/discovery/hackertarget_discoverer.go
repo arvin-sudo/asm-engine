@@ -1,8 +1,8 @@
 package discovery
 
 import (
+	"bufio"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -45,6 +45,11 @@ func NewHackerTargetDiscoverer(client HTTPClient) *HackerTargetDiscoverer {
 
 // Discover queries HackerTarget for all known subdomains of domain.
 //
+// The response body is consumed line-by-line with bufio.Scanner rather than
+// buffered in full with io.ReadAll. CT and WayBack both stream-decode their
+// responses; HackerTarget now matches that pattern, keeping peak memory
+// proportional to the longest single line rather than the full response.
+//
 // A 429 response is treated as an empty result rather than an error — the free
 // tier quota being exhausted is a transient infrastructure limit, not a fault
 // in the pipeline. All other non-200 responses are returned as errors.
@@ -66,47 +71,31 @@ func (d *HackerTargetDiscoverer) Discover(domain string) ([]models.Subdomain, er
 		return nil, fmt.Errorf("hackertarget_discoverer: unexpected status %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("hackertarget_discoverer: read body: %w", err)
-	}
-
-	return parseHackerTargetLines(string(body), domain, hackertargetSource), nil
-}
-
-// parseHackerTargetLines converts the plain-text HackerTarget response into a
-// deduplicated slice of Subdomain values scoped to targetDomain.
-//
-// The response format is one entry per line: "hostname,ip". Lines without a
-// comma are silently skipped — this handles both malformed entries and the
-// "API count exceeded" error string that some HackerTarget configurations
-// embed in a 200 response body alongside the normal data.
-//
-// Scope filtering mirrors parseSubdomains in ct_discoverer.go: only names that
-// equal or are direct subdomains of targetDomain are kept, preventing unrelated
-// domains from leaking into the scan results.
-func parseHackerTargetLines(body, targetDomain, source string) []models.Subdomain {
-	target := strings.ToLower(strings.TrimSpace(targetDomain))
+	target := strings.ToLower(strings.TrimSpace(domain))
 	seen := make(map[string]struct{})
 	var result []models.Subdomain
 
-	for _, line := range strings.Split(body, "\n") {
-		line = strings.TrimSpace(line)
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		// Lines without a comma are not valid "hostname,ip" entries. This also
+		// handles the "API count exceeded" error string HackerTarget embeds in
+		// some 200 responses alongside real data.
 		if line == "" || !strings.Contains(line, ",") {
 			continue
 		}
 		name := strings.ToLower(strings.TrimSpace(strings.SplitN(line, ",", 2)[0]))
-		if name == "" {
-			continue
-		}
-		if name != target && !strings.HasSuffix(name, "."+target) {
+		if name == "" || (name != target && !strings.HasSuffix(name, "."+target)) {
 			continue
 		}
 		if _, ok := seen[name]; ok {
 			continue
 		}
 		seen[name] = struct{}{}
-		result = append(result, models.Subdomain{Name: name, Source: source})
+		result = append(result, models.Subdomain{Name: name, Source: hackertargetSource})
 	}
-	return result
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("hackertarget_discoverer: scan body: %w", err)
+	}
+	return result, nil
 }

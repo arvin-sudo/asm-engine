@@ -165,16 +165,9 @@ func NewWebStackFingerprinter(timeout time.Duration) *WebStackFingerprinter {
 		timeout = defaultFingerprintTimeout
 	}
 	return &WebStackFingerprinter{
-		timeout: timeout,
-		httpPorts: map[int]bool{
-			80:   true,
-			8080: true,
-			8888: true,
-		},
-		httpsPorts: map[int]bool{
-			443:  true,
-			8443: true,
-		},
+		timeout:    timeout,
+		httpPorts:  buildPortMap(defaultHTTPPorts),
+		httpsPorts: buildPortMap(defaultHTTPSPorts),
 	}
 }
 

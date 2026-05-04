@@ -1312,3 +1312,52 @@ This is the core academic deliverable. The same pipeline will be implemented in 
 - Behavioural correctness under load (correct handling of timeouts, partial reads, concurrent resource limits)
 
 The worker pool in Phase 2a is the primary subject of this comparison. Go's goroutines are lightweight (2–8 KB initial stack vs. a Python thread's 1–8 MB), which means a Go pool of 100 workers uses roughly 1–2 MB of stack memory. A Python equivalent using threads would use significantly more. The benchmark will quantify this difference under controlled conditions.
+
+---
+
+## Fourteenth Refactor Pass (2026-05-04)
+
+A second full-codebase audit after the Thirteenth Pass. Seven confirmed issues addressed. All changes pass `go test -race ./...`, `go vet ./...`, and `go build ./...`.
+
+### 1. Port constants DRY — new `internal/fingerprint/ports.go`
+
+`NewBannerFingerprinter` and `NewWebStackFingerprinter` each hardcoded identical maps (`{80, 8080, 8888}` for HTTP and `{443, 8443}` for HTTPS). Adding a non-standard port required editing two constructors in two structs. Fix: new file `internal/fingerprint/ports.go` with package-level `defaultHTTPPorts []int`, `defaultHTTPSPorts []int`, and a `buildPortMap([]int) map[int]bool` helper. Both constructors now call `buildPortMap(defaultHTTPPorts)` and `buildPortMap(defaultHTTPSPorts)` — one file to update, one concept per name.
+
+### 2. Performance — `MultiSourceDiscoverer` concurrent fan-out
+
+Sources were queried sequentially. With three sources at 30 s / 10 s / 60 s timeouts, worst-case Phase 1a latency was their sum (~100 s). Each source now runs in its own goroutine; results are written to pre-indexed slots (`results[i]`) so no mutex is required during collection. A `sync.WaitGroup` signals completion; the merge happens sequentially in original source order, which preserves the first-source-wins deduplication guarantee. Worst-case latency is now the maximum single-source timeout (~60 s). This is also a Phase 5 thesis argument: Go makes goroutine-based fan-out concise and safe.
+
+### 3. Memory efficiency — HackerTarget streaming
+
+`HackerTargetDiscoverer.Discover` used `io.ReadAll(resp.Body)` to buffer the entire response before parsing, while CT and WayBack both stream-decode their responses. Fix: replaced `io.ReadAll + parseHackerTargetLines` with an inline `bufio.NewScanner(resp.Body)` loop. Peak memory is now proportional to the longest single line rather than the full response. The now-unused `parseHackerTargetLines` function was deleted; all existing tests exercised `Discover` via a mock HTTP client and pass unchanged.
+
+### 4. Bug — empty domain silently probed malformed URLs
+
+`BucketHunter.Scan("")` called `candidatesFromDomain("")`, which produced candidates like `""` and `"-backup"`. These generated probe URLs such as `"https://.s3.amazonaws.com"` — structurally malformed but silently skipped at the DNS/HTTP layer with no error. Fix: early-return guard at the top of `Scan`: if `domain == ""` return `nil, nil` immediately. A test case was added to `bucket_hunter_test.go` verifying that an empty domain produces zero results.
+
+### 5. Output label inconsistency — `[public]`
+
+Every output label in the CLI was lowercase (`[live]`, `[dead]`, `[ptr-live]`, `[private]`) except the accessible-bucket label, which was `[PUBLIC]`. Changed to `[public]` to match the rest of the output format.
+
+### 6. Misleading test comment — `vulndb_test.go`
+
+The test case for `"apache version predating traversal range"` (version 2.4.41) had a comment saying "traversal rule should NOT fire" with `wantNone: false`. The comment explained only the rule that *doesn't* fire, not why the test expects a result. Rewritten: the comment now explains that the path-traversal CVE (min 2.4.49) does not fire, but the mod_lua buffer-overflow CVE (max 2.4.51, no minVersion) does fire because 2.4.41 ≤ 2.4.51.
+
+### 7. Undocumented behaviour — `splitVersion` distro suffixes
+
+`splitVersion("1.18.0-ubuntu1")` silently produces `[1, 18, 0]` because `strconv.Atoi("0-ubuntu1")` fails and is treated as zero. This is correct for the CVE dataset (all bounds are clean dotted-decimal or OpenSSH p-notation), but was invisible to future maintainers. A comment was added in `splitVersion` explaining the approximation. A test case was added to `TestCompareVersions`: `{"distro suffix treated as zero component", "1.18.0-ubuntu1", "1.18.0", 0}`.
+
+### Files modified
+
+| File | Change |
+|------|--------|
+| `internal/fingerprint/ports.go` | **New** — shared port slices + `buildPortMap` helper |
+| `internal/fingerprint/banner_fingerprinter.go` | Constructor uses `buildPortMap(defaultHTTPPorts/HTTPSPorts)` |
+| `internal/fingerprint/web_stack_fingerprinter.go` | Constructor uses `buildPortMap(defaultHTTPPorts/HTTPSPorts)` |
+| `internal/discovery/multi_source_discoverer.go` | Concurrent fan-out with `sync.WaitGroup`; merge in source order |
+| `internal/discovery/hackertarget_discoverer.go` | `bufio.Scanner` streaming; `parseHackerTargetLines` deleted |
+| `internal/cloudscan/bucket_hunter.go` | Empty domain guard at top of `Scan` |
+| `internal/cloudscan/bucket_hunter_test.go` | Empty domain test case |
+| `cmd/asm/main.go` | `[PUBLIC]` → `[public]` |
+| `internal/vulndb/vulndb_test.go` | Misleading comment rewritten; distro-suffix test case added |
+| `internal/vulndb/vulndb.go` | `splitVersion` comment explaining distro-suffix approximation |

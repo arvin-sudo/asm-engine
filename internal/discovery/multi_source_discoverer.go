@@ -2,13 +2,14 @@ package discovery
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/arvin-sudo/asm-engine/pkg/models"
 )
 
 // MultiSourceDiscoverer fans out a single Discover call to N
-// SubdomainDiscoverer implementations and returns the merged, deduplicated
-// result.
+// SubdomainDiscoverer implementations concurrently and returns the merged,
+// deduplicated result.
 //
 // Why aggregate here rather than in main.go?
 // Merging and deduplicating across sources requires a seen-map and error
@@ -18,47 +19,74 @@ import (
 // it sees a single SubdomainDiscoverer and has no knowledge of which concrete
 // implementations sit behind it.
 //
-// Partial failure policy: if one source returns an error its results are
-// silently skipped and the remaining sources are still queried. A total
-// failure — every source erroring — is reported as a single aggregated error.
-// This mirrors the behaviour of a load balancer: one backend failing must not
-// abort the whole request.
+// Concurrency strategy: each source runs in its own goroutine. Results are
+// written to pre-indexed slots (results[i]) — one slot per goroutine — so no
+// mutex is needed during collection. After all goroutines finish (sync.WaitGroup),
+// the results are merged in original source order. Preserving order is what
+// maintains first-source-wins deduplication: if "api.example.com" appears in
+// both crt.sh (index 0) and HackerTarget (index 1), the crt.sh record is always
+// merged first, so its Source tag wins. With concurrent collection this
+// guarantee would be lost; the sequential merge restores it.
+//
+// Partial failure policy: if one source returns an error its slot is skipped
+// and the remaining sources still contribute results. A total failure — every
+// source erroring — is reported as a single aggregated error. This mirrors the
+// behaviour of a load balancer: one backend failing must not abort the whole
+// request.
 type MultiSourceDiscoverer struct {
 	sources []SubdomainDiscoverer
 }
 
 // NewMultiSourceDiscoverer constructs a MultiSourceDiscoverer wrapping the
-// provided sources. Sources are queried in the order they are given.
-// Deduplication preserves the first occurrence of each hostname, so earlier
-// sources take precedence for the Source tag — the source that originally
-// found a name is the one recorded in Subdomain.Source.
+// provided sources. Sources are queried concurrently. Deduplication preserves
+// the first occurrence of each hostname in the original source order, so
+// earlier sources take precedence for the Source tag.
 func NewMultiSourceDiscoverer(sources ...SubdomainDiscoverer) *MultiSourceDiscoverer {
 	return &MultiSourceDiscoverer{sources: sources}
 }
 
-// Discover queries every registered source and returns all unique subdomains.
+// sourceResult holds the outcome of one source's Discover call.
+type sourceResult struct {
+	subdomains []models.Subdomain
+	err        error
+}
+
+// Discover queries every registered source concurrently and returns all unique
+// subdomains.
 //
 // Deduplication is by hostname: if "api.example.com" appears in both crt.sh
-// and HackerTarget, only the first occurrence is kept and its Source tag
-// reflects that source. This preserves accurate per-source attribution for
-// coverage analysis.
+// and HackerTarget, only the first occurrence (in original source order) is
+// kept and its Source tag reflects that source. This preserves accurate
+// per-source attribution for coverage analysis.
 //
 // If every source fails, Discover returns an error describing the total count.
 // If only some sources fail, the partial results from the successful sources
 // are returned with a nil error — the caller should not need to handle missing
 // sources from individual failed discoverers.
 func (m *MultiSourceDiscoverer) Discover(domain string) ([]models.Subdomain, error) {
+	results := make([]sourceResult, len(m.sources))
+
+	var wg sync.WaitGroup
+	for i, src := range m.sources {
+		wg.Add(1)
+		go func(i int, src SubdomainDiscoverer) {
+			defer wg.Done()
+			found, err := src.Discover(domain)
+			results[i] = sourceResult{subdomains: found, err: err}
+		}(i, src)
+	}
+	wg.Wait()
+
+	// Merge in original source order to preserve first-source-wins deduplication.
 	seen := make(map[string]struct{})
 	var result []models.Subdomain
 	successCount := 0
-
-	for _, src := range m.sources {
-		found, err := src.Discover(domain)
-		if err != nil {
+	for _, r := range results {
+		if r.err != nil {
 			continue
 		}
 		successCount++
-		for _, sub := range found {
+		for _, sub := range r.subdomains {
 			if _, ok := seen[sub.Name]; ok {
 				continue
 			}

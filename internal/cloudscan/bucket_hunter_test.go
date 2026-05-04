@@ -102,6 +102,14 @@ func TestBucketHunter_Scan(t *testing.T) {
 			wantCount:      1,
 			wantAccessible: 1,
 		},
+		{
+			// An empty domain must return immediately without probing any URL.
+			// candidatesFromDomain("") generates names like "" and "-backup" that
+			// produce malformed URLs; the guard prevents those from ever being built.
+			name:      "empty domain produces no results",
+			domain:    "",
+			wantCount: 0,
+		},
 	}
 
 	for _, tt := range tests {

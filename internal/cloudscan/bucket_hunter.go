@@ -49,7 +49,14 @@ func NewBucketHunter(client HeadClient) *BucketHunter {
 // responds with 200 (publicly accessible) or 403 (exists but private).
 // 404 responses and network-level errors are silently skipped — one unreachable
 // candidate must not stop the rest of the sweep.
+//
+// An empty domain returns immediately with no results. candidatesFromDomain("")
+// would otherwise generate candidates like "" and "-backup" that produce
+// malformed probe URLs rejected at the DNS or HTTP layer.
 func (h *BucketHunter) Scan(domain string) ([]models.BucketResult, error) {
+	if domain == "" {
+		return nil, nil
+	}
 	candidates := candidatesFromDomain(domain)
 	urls := buildURLs(candidates)
 

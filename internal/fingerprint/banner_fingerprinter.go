@@ -55,17 +55,10 @@ func NewBannerFingerprinter(timeout time.Duration, readLimit int) *BannerFingerp
 		readLimit = defaultReadLimit
 	}
 	return &BannerFingerprinter{
-		timeout:   timeout,
-		readLimit: readLimit,
-		httpPorts: map[int]bool{
-			80:   true,
-			8080: true,
-			8888: true,
-		},
-		httpsPorts: map[int]bool{
-			443:  true,
-			8443: true,
-		},
+		timeout:    timeout,
+		readLimit:  readLimit,
+		httpPorts:  buildPortMap(defaultHTTPPorts),
+		httpsPorts: buildPortMap(defaultHTTPSPorts),
 	}
 }
 

@@ -313,8 +313,13 @@ func splitVersion(v string) []int {
 		}
 		n, err := strconv.Atoi(s)
 		if err != nil {
-			// Non-numeric component — treat as zero rather than failing the whole
-			// comparison. This handles unusual suffixes like "1.18.0-ubuntu1".
+			// Non-numeric components — including distribution suffixes such as
+			// "0-ubuntu1" or "3-debian1" — are treated as zero. This is correct
+			// for our CVE dataset because all version bounds are clean
+			// dotted-decimal or OpenSSH p-notation. A distro-patched version
+			// like "1.18.0-ubuntu1" therefore compares identically to "1.18.0",
+			// which may miss a distro backport; for the thesis dataset this is
+			// an acceptable approximation.
 			n = 0
 		}
 		parts = append(parts, n)

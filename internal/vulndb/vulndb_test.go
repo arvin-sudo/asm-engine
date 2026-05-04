@@ -18,6 +18,10 @@ func TestCompareVersions(t *testing.T) {
 		{"different depths less", "1.18", "1.18.1", -1},
 		{"patch boundary", "2.4.50", "2.4.50", 0},
 		{"major version dominates", "3.0.0", "2.99.99", 1},
+		// Distribution suffixes like "-ubuntu1" are non-numeric: Atoi fails and
+		// the component is treated as zero. "1.18.0-ubuntu1" → [1, 18, 0] which
+		// equals [1, 18, 0], so the two versions compare as equal.
+		{"distro suffix treated as zero component", "1.18.0-ubuntu1", "1.18.0", 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -76,10 +80,14 @@ func TestVulnDB_Check(t *testing.T) {
 			wantCVEs: []string{"CVE-2021-41773"},
 		},
 		{
+			// 2.4.41 is below the path-traversal minVersion (2.4.49) so
+			// CVE-2021-41773 does NOT fire. However, the mod_lua buffer-overflow
+			// rule (CVE-2021-44790, maxVersion 2.4.51, no minVersion) does fire —
+			// 2.4.41 ≤ 2.4.51. Expect exactly one result (the buffer-overflow).
 			name:     "apache version predating traversal range",
 			service:  "apache",
 			version:  "2.4.41",
-			wantNone: false, // 2.4.41 < 2.4.49 so traversal rule should NOT fire
+			wantNone: false,
 		},
 		{
 			name:     "apache patched past 2.4.52",

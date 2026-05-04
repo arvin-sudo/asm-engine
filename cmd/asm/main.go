@@ -578,7 +578,7 @@ func main() {
 				}
 			}
 			if b.Accessible {
-				fmt.Printf("  [PUBLIC]   %-60s (%s)\n", b.URL, b.Provider)
+				fmt.Printf("  [public]   %-60s (%s)\n", b.URL, b.Provider)
 				publicCount++
 			} else {
 				fmt.Printf("  [private]  %-60s (%s)\n", b.URL, b.Provider)
