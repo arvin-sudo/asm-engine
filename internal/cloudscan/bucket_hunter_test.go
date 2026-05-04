@@ -275,3 +275,92 @@ func TestCandidatesFromDomain(t *testing.T) {
 		})
 	}
 }
+
+// TestBuildURLs verifies the exact URLs and provider labels that buildURLs
+// generates for each cloud storage platform. The Scan integration tests exercise
+// buildURLs indirectly — they key the mock by URL, so a URL format bug would
+// silently pass (the mock would just return 404 and the test would see zero
+// results). This test pins the expected URLs directly.
+func TestBuildURLs(t *testing.T) {
+	t.Run("empty candidates returns no entries", func(t *testing.T) {
+		if got := buildURLs(nil); len(got) != 0 {
+			t.Errorf("buildURLs(nil) = %d entries, want 0", len(got))
+		}
+	})
+
+	t.Run("single candidate produces five entries", func(t *testing.T) {
+		got := buildURLs([]string{"example"})
+		if len(got) != 5 {
+			t.Fatalf("buildURLs([example]) = %d entries, want 5; entries: %v", len(got), got)
+		}
+	})
+
+	t.Run("provider counts are correct for one candidate", func(t *testing.T) {
+		got := buildURLs([]string{"example"})
+		counts := map[string]int{}
+		for _, e := range got {
+			counts[e.provider]++
+		}
+		if counts[providerAWSS3] != 2 {
+			t.Errorf("aws_s3 count = %d, want 2", counts[providerAWSS3])
+		}
+		if counts[providerAzureBlob] != 1 {
+			t.Errorf("azure_blob count = %d, want 1", counts[providerAzureBlob])
+		}
+		if counts[providerGCPStorage] != 2 {
+			t.Errorf("gcp_storage count = %d, want 2", counts[providerGCPStorage])
+		}
+	})
+
+	t.Run("URL formats are correct for candidate example", func(t *testing.T) {
+		got := buildURLs([]string{"example"})
+		urlSet := make(map[string]string, len(got)) // url → provider
+		for _, e := range got {
+			urlSet[e.url] = e.provider
+		}
+
+		wantURLs := []struct {
+			url      string
+			provider string
+		}{
+			{"https://example.s3.amazonaws.com", providerAWSS3},
+			{"https://s3.amazonaws.com/example", providerAWSS3},
+			{"https://example.blob.core.windows.net/example?restype=container", providerAzureBlob},
+			{"https://storage.googleapis.com/example", providerGCPStorage},
+			{"https://example.storage.googleapis.com", providerGCPStorage},
+		}
+		for _, w := range wantURLs {
+			got, ok := urlSet[w.url]
+			if !ok {
+				t.Errorf("missing expected URL %q", w.url)
+				continue
+			}
+			if got != w.provider {
+				t.Errorf("URL %q: provider = %q, want %q", w.url, got, w.provider)
+			}
+		}
+	})
+
+	t.Run("two candidates produce ten entries with no cross-contamination", func(t *testing.T) {
+		got := buildURLs([]string{"alpha", "beta"})
+		if len(got) != 10 {
+			t.Fatalf("buildURLs([alpha, beta]) = %d entries, want 10", len(got))
+		}
+		// Both names must appear in AWS virtual-hosted URLs.
+		hasAlpha, hasBeta := false, false
+		for _, e := range got {
+			if e.url == "https://alpha.s3.amazonaws.com" {
+				hasAlpha = true
+			}
+			if e.url == "https://beta.s3.amazonaws.com" {
+				hasBeta = true
+			}
+		}
+		if !hasAlpha {
+			t.Error("missing AWS virtual-hosted URL for candidate alpha")
+		}
+		if !hasBeta {
+			t.Error("missing AWS virtual-hosted URL for candidate beta")
+		}
+	})
+}

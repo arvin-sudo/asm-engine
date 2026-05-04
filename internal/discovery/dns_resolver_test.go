@@ -91,3 +91,63 @@ func TestDNSResolver_Discover(t *testing.T) {
 		})
 	}
 }
+
+// TestDeduplicateIPs directly exercises the IP deduplication helper. Discover
+// tests cover it indirectly but do not pin the order-preservation guarantee or
+// the all-duplicates edge case.
+func TestDeduplicateIPs(t *testing.T) {
+	tests := []struct {
+		name string
+		ips  []string
+		want []string
+	}{
+		{
+			name: "nil input returns empty slice",
+			ips:  nil,
+			want: []string{},
+		},
+		{
+			name: "empty slice returns empty slice",
+			ips:  []string{},
+			want: []string{},
+		},
+		{
+			// Order must be preserved so the output is deterministic.
+			name: "no duplicates preserves order",
+			ips:  []string{"1.2.3.4", "5.6.7.8", "9.10.11.12"},
+			want: []string{"1.2.3.4", "5.6.7.8", "9.10.11.12"},
+		},
+		{
+			// The first occurrence is kept; subsequent occurrences are dropped.
+			name: "one duplicate in middle is removed, first kept",
+			ips:  []string{"1.2.3.4", "5.6.7.8", "1.2.3.4"},
+			want: []string{"1.2.3.4", "5.6.7.8"},
+		},
+		{
+			// All entries the same: only the first is kept.
+			name: "all same IPs reduces to single entry",
+			ips:  []string{"1.2.3.4", "1.2.3.4", "1.2.3.4"},
+			want: []string{"1.2.3.4"},
+		},
+		{
+			// Multiple distinct duplicates, order of first occurrence preserved.
+			name: "multiple distinct duplicates preserved in order of first occurrence",
+			ips:  []string{"a", "b", "a", "c", "b"},
+			want: []string{"a", "b", "c"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := deduplicateIPs(tt.ips)
+			if len(got) != len(tt.want) {
+				t.Fatalf("deduplicateIPs(%v) = %v, want %v", tt.ips, got, tt.want)
+			}
+			for i, ip := range got {
+				if ip != tt.want[i] {
+					t.Errorf("deduplicateIPs result[%d] = %q, want %q", i, ip, tt.want[i])
+				}
+			}
+		})
+	}
+}

@@ -3,7 +3,19 @@ package discovery
 import (
 	"net"
 	"testing"
+
+	"github.com/arvin-sudo/asm-engine/pkg/models"
 )
+
+// hasService returns true if any indicator in the slice has the given service name.
+func hasService(indicators []models.ServiceIndicator, service string) bool {
+	for _, ind := range indicators {
+		if ind.Service == service {
+			return true
+		}
+	}
+	return false
+}
 
 // mockDNSIntelResolver is a test double for DNSIntelResolver.
 type mockDNSIntelResolver struct {
@@ -152,6 +164,138 @@ func TestDNSIntelligenceScanner_Scan(t *testing.T) {
 					if gotServices[svc] != tt.wantRecords[i] {
 						t.Errorf("service %q: Record = %q, want %q", svc, gotServices[svc], tt.wantRecords[i])
 					}
+				}
+			}
+		})
+	}
+}
+
+// TestParseSPF directly exercises the SPF helper, focusing on cases that the
+// higher-level Scan tests do not reach — in particular the suffix-match branch
+// (e.g. "eu.mailgun.org" matching the "mailgun.org" pattern).
+func TestParseSPF(t *testing.T) {
+	tests := []struct {
+		name         string
+		txts         []string
+		wantServices []string
+		wantCount    int
+	}{
+		{
+			name:         "empty TXT records return no indicators",
+			txts:         nil,
+			wantCount:    0,
+		},
+		{
+			name:         "non-SPF TXT record is ignored",
+			txts:         []string{"google-site-verification=abc123"},
+			wantCount:    0,
+		},
+		{
+			// Exact match: include target equals the pattern key directly.
+			name:         "exact include match detects Mailgun",
+			txts:         []string{"v=spf1 include:mailgun.org ~all"},
+			wantServices: []string{"Mailgun"},
+			wantCount:    1,
+		},
+		{
+			// Suffix match: "eu.mailgun.org" ends with ".mailgun.org".
+			// This branch is never exercised by the Scan-level tests, which only
+			// use exact include targets.
+			name:         "subdomain include target matches via suffix rule",
+			txts:         []string{"v=spf1 include:eu.mailgun.org ~all"},
+			wantServices: []string{"Mailgun"},
+			wantCount:    1,
+		},
+		{
+			// Two patterns map to the same service — dedup must fire.
+			name:         "same service from two patterns reported once",
+			txts:         []string{"v=spf1 include:_spf.google.com include:google.com ~all"},
+			wantServices: []string{"Google Workspace"},
+			wantCount:    1,
+		},
+		{
+			// Token without "include:" prefix must be silently ignored.
+			name:         "non-include token does not produce an indicator",
+			txts:         []string{"v=spf1 ip4:192.0.2.0/24 ~all"},
+			wantCount:    0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseSPF(tt.txts)
+			if len(got) != tt.wantCount {
+				t.Errorf("parseSPF: got %d indicator(s), want %d; results: %v",
+					len(got), tt.wantCount, got)
+			}
+			for _, svc := range tt.wantServices {
+				if !hasService(got, svc) {
+					t.Errorf("parseSPF: expected service %q not found in %v", svc, got)
+				}
+			}
+		})
+	}
+}
+
+// TestParseMX directly exercises the MX helper, verifying trailing-dot stripping
+// and deduplication. The Scan tests confirm overall behaviour but never assert
+// that the dot-strip step specifically causes the match to succeed.
+func TestParseMX(t *testing.T) {
+	tests := []struct {
+		name         string
+		mxs          []*net.MX
+		wantServices []string
+		wantCount    int
+	}{
+		{
+			name:      "nil MX slice returns no indicators",
+			mxs:       nil,
+			wantCount: 0,
+		},
+		{
+			name:      "unrecognised MX host returns no indicators",
+			mxs:       []*net.MX{{Host: "mail.unknown-provider.example."}},
+			wantCount: 0,
+		},
+		{
+			// The trailing FQDN dot must be stripped before matching.
+			// Without stripping, "aspmx.l.google.com." would not end with
+			// ".google.com" and the match would silently fail.
+			name:         "trailing dot is stripped before matching",
+			mxs:          []*net.MX{{Host: "aspmx.l.google.com."}},
+			wantServices: []string{"Google Workspace"},
+			wantCount:    1,
+		},
+		{
+			// The same result must be produced when there is no trailing dot,
+			// confirming the strip is safe to apply unconditionally.
+			name:         "host without trailing dot also matches",
+			mxs:          []*net.MX{{Host: "aspmx.l.google.com"}},
+			wantServices: []string{"Google Workspace"},
+			wantCount:    1,
+		},
+		{
+			// Three failover MX records for the same provider must be deduplicated
+			// to a single indicator.
+			name: "multiple failover records for same provider deduplicated",
+			mxs: []*net.MX{
+				{Host: "aspmx.l.google.com."},
+				{Host: "alt1.aspmx.l.google.com."},
+				{Host: "alt2.aspmx.l.google.com."},
+			},
+			wantServices: []string{"Google Workspace"},
+			wantCount:    1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseMX(tt.mxs)
+			if len(got) != tt.wantCount {
+				t.Errorf("parseMX: got %d indicator(s), want %d; results: %v",
+					len(got), tt.wantCount, got)
+			}
+			for _, svc := range tt.wantServices {
+				if !hasService(got, svc) {
+					t.Errorf("parseMX: expected service %q not found in %v", svc, got)
 				}
 			}
 		})

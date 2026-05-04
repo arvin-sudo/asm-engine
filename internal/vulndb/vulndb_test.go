@@ -131,6 +131,36 @@ func TestVulnDB_Check(t *testing.T) {
 			version:  "",
 			wantCVEs: []string{"CVE-2024-23184"},
 		},
+		{
+			name:     "pop3 fires unconditionally",
+			service:  "pop3",
+			version:  "",
+			wantCVEs: []string{"CVE-2024-23184"},
+		},
+		{
+			name:     "smtp at max boundary 3.5.22 matches",
+			service:  "smtp",
+			version:  "3.5.22",
+			wantCVEs: []string{"CVE-2023-51764"},
+		},
+		{
+			name:     "smtp patched at 3.5.23 does not match",
+			service:  "smtp",
+			version:  "3.5.23",
+			wantNone: true,
+		},
+		{
+			name:     "ftp at max boundary 1.3.7 matches",
+			service:  "ftp",
+			version:  "1.3.7",
+			wantCVEs: []string{"CVE-2023-48795"},
+		},
+		{
+			name:     "ftp patched at 1.3.8 does not match",
+			service:  "ftp",
+			version:  "1.3.8",
+			wantNone: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -166,5 +196,46 @@ func TestVulnDB_Check_CaseInsensitive(t *testing.T) {
 	got := db.Check("NGINX", "1.18.0")
 	if len(got) == 0 {
 		t.Error("Check(NGINX) must match lowercase nginx rules")
+	}
+}
+
+// TestSplitVersion directly exercises the version-string parser that underpins
+// all CVE range checks. compareVersions tests cover the comparison logic but
+// not the parsing rules — a change to the 'p'-separator handling or the
+// distro-suffix treatment would pass compareVersions tests while silently
+// breaking the parser.
+func TestSplitVersion(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  []int
+	}{
+		// Empty string: Split produces [""], the empty component is skipped,
+		// result is an empty slice rather than a panic.
+		{"empty string", "", []int{}},
+		{"single component", "5", []int{5}},
+		{"dotted decimal", "1.18.0", []int{1, 18, 0}},
+		// OpenSSH 'p' separator: "8.4p1" → "8.4.1" after replacement.
+		{"openssh p-notation", "8.4p1", []int{8, 4, 1}},
+		{"openssh high version", "9.8p1", []int{9, 8, 1}},
+		// Short p-notation with no minor: "8p1" → "8.1".
+		{"short p-notation no minor", "8p1", []int{8, 1}},
+		// Distribution suffixes such as "-ubuntu1" make the component
+		// non-numeric; Atoi fails and the component is treated as zero.
+		// "1.18.0-ubuntu1" splits as ["1", "18", "0-ubuntu1"] → [1, 18, 0].
+		{"distro suffix treated as zero", "1.18.0-ubuntu1", []int{1, 18, 0}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := splitVersion(tt.input)
+			if len(got) != len(tt.want) {
+				t.Fatalf("splitVersion(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+			for i, v := range got {
+				if v != tt.want[i] {
+					t.Errorf("splitVersion(%q)[%d] = %d, want %d", tt.input, i, v, tt.want[i])
+				}
+			}
+		})
 	}
 }
