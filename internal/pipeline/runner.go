@@ -180,7 +180,7 @@ func (r *Runner) execute(ctx context.Context, cfg Config, ch chan<- ScanEvent) {
 	// Phase 2 — TCP port scanning + fingerprinting
 	// -------------------------------------------------------------------------
 	if len(liveAssets) > 0 {
-		r.runPhase2(ctx, domain, cfg, liveAssets, ch)
+		r.runPhase2(ctx, cfg, liveAssets, ch)
 	} else {
 		emit(ch, newEvent(EventPhaseComplete, PhasePayload{
 			Phase:   "2",
@@ -381,7 +381,7 @@ func (r *Runner) runPhase1(ctx context.Context, domain string, ch chan<- ScanEve
 
 // runPhase2 runs TCP scanning, fingerprinting, vuln checking, and differential
 // analysis for all live assets.
-func (r *Runner) runPhase2(ctx context.Context, domain string, cfg Config, liveAssets []models.Asset, ch chan<- ScanEvent) {
+func (r *Runner) runPhase2(ctx context.Context, cfg Config, liveAssets []models.Asset, ch chan<- ScanEvent) {
 	msg := fmt.Sprintf("Phase 2: scanning %d port(s) on %d live asset(s) — %d workers, %v timeout",
 		len(cfg.Ports), len(liveAssets), cfg.Workers, cfg.ScanTimeout)
 	if cfg.RateLimit > 0 {
