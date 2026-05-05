@@ -25,7 +25,7 @@
       background: var(--bg);
       color: var(--text);
       font-family: var(--font);
-      font-size: 14px;
+      font-size: 16px;
       min-height: 100vh;
     }
 
@@ -88,14 +88,30 @@
     .search-wrap button:hover { opacity: .85; }
     .search-wrap button:disabled { opacity: .45; cursor: default; }
 
-    /* ── Four-card grid ───────────────────────────────────────── */
+    /* ── Page layout: progress panel + four-card grid ────────── */
+    .page-layout {
+      display: flex;
+      gap: 1rem;
+      max-width: 1600px;
+      margin: 0 auto;
+      padding: 0 1.5rem 4rem;
+      align-items: stretch;
+    }
+
+    .progress-panel {
+      flex: 0 0 240px;
+      min-height: 660px;
+    }
+
     .grid {
+      flex: 1;
       display: grid;
       grid-template-columns: 1fr 1fr;
       gap: 1rem;
-      max-width: 1440px;
-      margin: 0 auto;
-      padding: 0 1.5rem 4rem;
+    }
+    @media (max-width: 1100px) {
+      .page-layout { flex-direction: column; }
+      .progress-panel { flex: none; min-height: 200px; }
     }
     @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
 
@@ -117,7 +133,7 @@
       background: var(--surface2);
     }
     .card-title {
-      font-size: .7rem;
+      font-size: .76rem;
       letter-spacing: 2px;
       color: var(--muted);
       text-transform: uppercase;
@@ -125,7 +141,7 @@
     }
     .card-count {
       margin-left: auto;
-      font-size: .7rem;
+      font-size: .76rem;
       color: var(--muted);
     }
     .card-body {
@@ -138,21 +154,21 @@
     .entry {
       padding: .35rem 0;
       border-bottom: 1px solid var(--surface2);
-      font-size: .8rem;
+      font-size: .9rem;
       line-height: 1.5;
       word-break: break-all;
     }
     .entry:last-child { border-bottom: none; }
 
-    .ip   { color: var(--muted); font-size: .75rem; }
+    .ip   { color: var(--muted); font-size: .85rem; }
     .svc  { color: var(--text); }
     .ver  { color: var(--accent); }
-    .evidence { color: var(--muted); font-size: .73rem; }
+    .evidence { color: var(--muted); font-size: .83rem; }
 
     /* ── Badges ───────────────────────────────────────────────── */
     .badge {
       display: inline-block;
-      font-size: .6rem;
+      font-size: .67rem;
       padding: 1px 5px;
       border-radius: 3px;
       font-weight: 700;
@@ -168,7 +184,7 @@
     /* ── Vulnerability lines ──────────────────────────────────── */
     .vuln {
       padding-left: 1.2rem;
-      font-size: .73rem;
+      font-size: .83rem;
       line-height: 1.4;
     }
     .vuln-CRITICAL { color: var(--red);   }
@@ -179,14 +195,32 @@
     /* ── Tech stack line ──────────────────────────────────────── */
     .tech {
       padding-left: 1.2rem;
-      font-size: .73rem;
+      font-size: .83rem;
       color: var(--muted);
+    }
+
+    /* ── Custom tooltip ──────────────────────────────────────────── */
+    #tooltip {
+      position: fixed;
+      background: #2d333b;
+      color: var(--text);
+      font-size: 0.79rem;
+      padding: 7px 12px;
+      border-radius: 5px;
+      border: 1px solid var(--border);
+      max-width: 300px;
+      line-height: 1.55;
+      z-index: 9999;
+      display: none;
+      white-space: normal;
+      cursor: text;
+      user-select: text;
     }
 
     /* ── Progress area (DNS intel card) ───────────────────────── */
     .progress-entry {
       padding: .28rem 0;
-      font-size: .75rem;
+      font-size: .85rem;
       color: var(--muted);
       border-bottom: 1px solid var(--surface2);
     }
@@ -202,10 +236,20 @@
       font-style: italic;
     }
 
+    /* ── Port risk icon ──────────────────────────────────────── */
+    .port-risk {
+      cursor: help;
+      margin-left: .35rem;
+      font-size: .85rem;
+      user-select: none;
+      vertical-align: middle;
+    }
+    .port-risk-low { color: var(--green); }
+
     /* ── Diff panel (inside Ports card) ──────────────────────── */
     .diff-entry {
       padding: .3rem 0;
-      font-size: .75rem;
+      font-size: .85rem;
       border-bottom: 1px solid var(--surface2);
     }
     .diff-entry:last-child { border-bottom: none; }
@@ -227,13 +271,26 @@
   <button id="scanBtn">SCAN</button>
 </div>
 
-<!-- ── Four-card grid ──────────────────────────────────────────── -->
+<!-- ── Page layout ─────────────────────────────────────────────── -->
+<div class="page-layout">
+
+<!-- Progress panel (left) -->
+<div class="card progress-panel">
+  <div class="card-header">
+    <span class="card-title" data-tooltip="Live log showing what the engine is doing right now — each scan phase in order.">Scan Progress</span>
+  </div>
+  <div class="card-body" id="list-progress">
+    <div class="empty" id="empty-progress">Waiting for scan...</div>
+  </div>
+</div>
+
+<!-- Four-card grid ──────────────────────────────────────────── -->
 <div class="grid">
 
   <!-- Card 1: Subdomains & Assets -->
   <div class="card">
     <div class="card-header">
-      <span class="card-title">Subdomains &amp; Assets</span>
+      <span class="card-title" data-tooltip="All hosts discovered for this domain. Shows which subdomains resolve to a live IP, and their addresses.">Subdomains &amp; Assets</span>
       <span class="card-count" id="count-sub">0</span>
     </div>
     <div class="card-body" id="list-sub">
@@ -244,7 +301,7 @@
   <!-- Card 2: Ports & Infrastructure -->
   <div class="card">
     <div class="card-header">
-      <span class="card-title">Ports &amp; Infrastructure</span>
+      <span class="card-title" data-tooltip="Open TCP ports found by actively scanning each live host. Service name and version come from banner grabbing and HTTP fingerprinting.">Ports &amp; Infrastructure</span>
       <span class="card-count" id="count-port">0</span>
     </div>
     <div class="card-body" id="list-port">
@@ -255,7 +312,7 @@
   <!-- Card 3: Cloud Buckets -->
   <div class="card">
     <div class="card-header">
-      <span class="card-title">Cloud Buckets</span>
+      <span class="card-title" data-tooltip="Storage buckets guessed from the domain name, checked against AWS S3, Azure Blob, and GCP. PUBLIC means the bucket was accessible without a password — a data-exposure risk.">Cloud Buckets</span>
       <span class="card-count" id="count-bucket">0</span>
     </div>
     <div class="card-body" id="list-bucket">
@@ -266,7 +323,7 @@
   <!-- Card 4: DNS Intelligence + Phase Progress -->
   <div class="card">
     <div class="card-header">
-      <span class="card-title">DNS Intelligence &amp; Progress</span>
+      <span class="card-title" data-tooltip="Third-party services detected via DNS TXT/MX records — e.g. email provider, CDN, cloud platform.">DNS Intelligence</span>
       <span class="card-count" id="count-dns">0</span>
     </div>
     <div class="card-body" id="list-dns">
@@ -274,7 +331,10 @@
     </div>
   </div>
 
-</div>
+</div><!-- end .grid -->
+</div><!-- end .page-layout -->
+
+<div id="tooltip"></div>
 
 <script>
 (function () {
@@ -288,6 +348,43 @@
   /* ── DOM refs ───────────────────────────────────────────── */
   const input   = document.getElementById('target');
   const btn     = document.getElementById('scanBtn');
+
+  /* ── Custom tooltip ─────────────────────────────────────── */
+  const tip = document.getElementById('tooltip');
+  let _showTimer = null;
+  let _hideTimer = null;
+
+  function _showTip(el) {
+    clearTimeout(_hideTimer);
+    _hideTimer = null;
+    tip.textContent = el.dataset.tooltip;
+    tip.style.left = '-9999px';
+    tip.style.display = 'block';
+    const r = el.getBoundingClientRect();
+    tip.style.left = Math.min(r.left, window.innerWidth  - tip.offsetWidth  - 8) + 'px';
+    tip.style.top  = Math.min(r.bottom + 6, window.innerHeight - tip.offsetHeight - 8) + 'px';
+  }
+
+  function _scheduleHide() {
+    _hideTimer = setTimeout(() => { tip.style.display = 'none'; }, 80);
+  }
+
+  document.addEventListener('mouseover', e => {
+    const el = e.target.closest('[data-tooltip]');
+    if (!el) return;
+    clearTimeout(_showTimer);
+    _showTimer = setTimeout(() => _showTip(el), 600);
+  });
+
+  document.addEventListener('mouseout', e => {
+    const el = e.target.closest('[data-tooltip]');
+    if (!el) return;
+    clearTimeout(_showTimer);
+    _scheduleHide();
+  });
+
+  tip.addEventListener('mouseenter', () => clearTimeout(_hideTimer));
+  tip.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
 
   /* ── Bind interactions ──────────────────────────────────── */
   btn.addEventListener('click', startScan);
@@ -308,6 +405,8 @@
       counts[id] = 0;
       document.getElementById('count-' + id).textContent = '0';
     });
+    document.getElementById('list-progress').innerHTML =
+      '<div class="empty" id="empty-progress">Scanning...</div>';
 
     scanning = true;
     btn.disabled = true;
@@ -363,17 +462,42 @@
 
     let label = '';
     switch (p.status) {
-      case 'dead':        label = '<span style="color:var(--muted)">[dead] </span>'; break;
-      case 'wildcard':    label = '<span style="color:var(--amber)">[wildcard] </span>'; break;
-      case 'ptr_live':    label = '<span style="color:var(--green)">[ptr] </span>'; break;
-      case 'ptr_dead':    label = '<span style="color:var(--muted)">[ptr-dead] </span>'; break;
-      case 'ptr_wildcard':label = '<span style="color:var(--amber)">[ptr-wildcard] </span>'; break;
+      case 'dead':        label = '<span style="color:var(--muted)" data-tooltip="This subdomain exists in DNS records but does not resolve to an IP — likely abandoned.">[dead] </span>'; break;
+      case 'wildcard':    label = '<span style="color:var(--amber)" data-tooltip="Wildcard DNS entry — the DNS server returns an IP for any subdomain, not just real ones. May be a false positive.">[wildcard] </span>'; break;
+      case 'ptr_live':    label = '<span style="color:var(--green)" data-tooltip="Discovered via reverse DNS (PTR) on an IP — this hostname was not found in subdomain search but is live.">[ptr] </span>'; break;
+      case 'ptr_dead':    label = '<span style="color:var(--muted)" data-tooltip="Discovered via PTR reverse DNS but does not resolve back — likely stale.">[ptr-dead] </span>'; break;
+      case 'ptr_wildcard':label = '<span style="color:var(--amber)" data-tooltip="PTR record points to a wildcard — may not represent a real host.">[ptr-wildcard] </span>'; break;
     }
 
     div.innerHTML = label + '<strong>' + esc(p.name) + '</strong>' + badge + ips;
     document.getElementById('list-sub').appendChild(div);
     tick('sub');
   }
+
+  /* ── Port risk knowledge base ──────────────────────────── */
+  const PORT_INFO = {
+    21:    { icon: '🔴', risk: 'critical', desc: 'FTP — unencrypted file transfer. Credentials sent in plaintext. Replace with SFTP over SSH (port 22).' },
+    22:    { icon: 'ℹ️', risk: 'info',     desc: 'SSH — encrypted remote administration. Normal to see on servers. Risk: brute-force on weak credentials. Use key-based auth.' },
+    23:    { icon: '🔴', risk: 'critical', desc: 'Telnet — unencrypted remote shell. All traffic including passwords is readable in transit. Should never be publicly exposed.' },
+    25:    { icon: 'ℹ️', risk: 'info',     desc: 'SMTP — email sending. Expected on mail servers. Verify this host is intentionally a mail server.' },
+    53:    { icon: 'ℹ️', risk: 'info',     desc: 'DNS (TCP) — DNS normally uses UDP; TCP/53 handles large responses and zone transfers. Verify this server is intentionally a DNS server.' },
+    80:    { icon: 'ℹ️', risk: 'info',     desc: 'HTTP — unencrypted web traffic. Expected for public web servers. Ideally redirect all traffic to HTTPS (443).' },
+    110:   { icon: '⚠️', risk: 'high',    desc: 'POP3 — unencrypted email retrieval. Credentials sent in plaintext. Prefer POP3S (port 995) with TLS.' },
+    143:   { icon: '⚠️', risk: 'high',    desc: 'IMAP — unencrypted email access. Credentials sent in plaintext. Prefer IMAPS (port 993) with TLS.' },
+    443:   { icon: '✓',  risk: 'low',     desc: 'HTTPS — encrypted web traffic with TLS. Correct and expected for public web servers.' },
+    445:   { icon: '🔴', risk: 'critical', desc: 'SMB — Windows file sharing. Exploited by WannaCry and NotPetya ransomware. Should never be directly internet-facing.' },
+    993:   { icon: '✓',  risk: 'low',     desc: 'IMAPS — encrypted IMAP over TLS. Correct and expected for secure email access.' },
+    995:   { icon: '✓',  risk: 'low',     desc: 'POP3S — encrypted POP3 over TLS. Correct for secure email retrieval.' },
+    1433:  { icon: '🔴', risk: 'critical', desc: 'MSSQL — Microsoft SQL Server. Databases should never be directly internet-facing. Restrict to internal networks.' },
+    3306:  { icon: '🔴', risk: 'critical', desc: 'MySQL — database port. Databases should never be directly exposed to the internet.' },
+    3389:  { icon: '⚠️', risk: 'high',    desc: 'RDP — Windows Remote Desktop. Frequent target for ransomware and brute-force attacks. Consider VPN instead of direct exposure.' },
+    5432:  { icon: '🔴', risk: 'critical', desc: 'PostgreSQL — database port. Should be behind a firewall, never directly internet-facing.' },
+    6379:  { icon: '🔴', risk: 'critical', desc: 'Redis — often runs without authentication by default. Many breaches from publicly exposed Redis instances.' },
+    8080:  { icon: '⚠️', risk: 'high',    desc: 'Alternate HTTP — often used for dev environments, proxies, or admin panels. Verify this port is intentionally public.' },
+    8443:  { icon: '⚠️', risk: 'high',    desc: 'Alternate HTTPS — commonly used for admin interfaces or staging. Verify this is intentionally public.' },
+    8888:  { icon: '⚠️', risk: 'high',    desc: 'Jupyter Notebook default port — often runs without authentication. Code execution risk if exposed publicly.' },
+    27017: { icon: '🔴', risk: 'critical', desc: 'MongoDB — databases should not be directly internet-facing. Numerous data breaches from exposed instances.' },
+  };
 
   /* ── Card 2: Ports & Infrastructure ────────────────────── */
   function onPort(p) {
@@ -392,9 +516,14 @@
       svcLine = ' <span style="color:var(--muted)">open</span>';
     }
 
+    const portInfo = PORT_INFO[p.port];
+    const riskIcon = portInfo
+      ? ' <span class="port-risk port-risk-' + portInfo.risk + '" data-tooltip="' + esc(portInfo.desc) + '">' + portInfo.icon + '</span>'
+      : ' <span class="port-risk" style="color:var(--muted)" data-tooltip="Unknown port — no information available for port ' + p.port + '. Investigate what service is running here.">?</span>';
+
     let html = '<span style="color:var(--accent)">' + esc(p.domain) + '</span>'
       + ' <span class="ip">' + esc(p.ip) + ':' + p.port + '/' + esc(p.proto) + '</span>'
-      + svcLine + badge;
+      + svcLine + riskIcon + badge;
 
     // Vulnerabilities
     if (p.vulnerabilities && p.vulnerabilities.length) {
@@ -449,20 +578,33 @@
     tick('dns');
   }
 
+  /* ── Phase tooltip map ──────────────────────────────────── */
+  const PHASE_TIPS = {
+    '1a': 'Passive subdomain enumeration using CT logs (crt.sh), HackerTarget, and WayBackMachine — no packets sent to the target.',
+    '1b': 'DNS resolution: each discovered subdomain is queried to find its IP address and check if it is live.',
+    '1c': 'Reverse DNS (PTR) lookups on discovered IPs — can reveal additional hostnames not found by subdomain search.',
+    '1d': 'DNS intelligence: TXT and MX records reveal third-party services used by the domain (e.g. email, CDN, cloud provider).',
+    '2':  'Active TCP port scan on all live hosts. Banner grabbing and HTTP fingerprinting identify services and their versions.',
+    '3':  'Cloud bucket hunt: guesses bucket names from the domain and checks AWS S3, Azure Blob, and GCP Storage for public access.',
+  };
+
   /* ── Card 4b: Phase progress ────────────────────────────── */
   function onPhase(p, done) {
     addProgress(p.message || '', done);
   }
 
   function addProgress(msg, done) {
-    clearEmpty('dns');
+    const el = document.getElementById('empty-progress');
+    if (el) el.remove();
     const div = document.createElement('div');
     div.className = 'progress-entry' + (done ? ' progress-done' : '');
     div.innerHTML = '<span class="progress-icon">' + (done ? '✓' : '›') + '</span>' + esc(msg);
-    document.getElementById('list-dns').appendChild(div);
-    // Auto-scroll progress to bottom
-    const body = document.getElementById('list-dns');
-    body.scrollTop = body.scrollHeight;
+    // Add tooltip when message references a known phase
+    const m = msg.match(/[Pp]hase\s+(1[abcd]|[23])\b/);
+    if (m) div.dataset.tooltip = PHASE_TIPS[m[1].toLowerCase()] || '';
+    const panel = document.getElementById('list-progress');
+    panel.appendChild(div);
+    panel.scrollTop = panel.scrollHeight;
   }
 
   /* ── Diff events (port open/close, version change, new asset) ── */
@@ -504,6 +646,14 @@
     btn.disabled = false;
     btn.textContent = 'SCAN';
     if (source) { source.close(); source = null; }
+    // Cards that received no events (e.g. phases skipped for local targets) stay
+    // on "Scanning..." — replace with a neutral state so it's clear the scan ended.
+    ['sub', 'port', 'bucket', 'dns'].forEach(id => {
+      const el = document.getElementById('empty-' + id);
+      if (el) el.textContent = 'No results.';
+    });
+    const ep = document.getElementById('empty-progress');
+    if (ep) ep.textContent = 'No progress recorded.';
   }
 
   /* ── Helpers ────────────────────────────────────────────── */
@@ -517,8 +667,16 @@
     document.getElementById('count-' + id).textContent = counts[id];
   }
 
+  const BADGE_TIPS = {
+    'PUBLIC':  'This bucket is publicly accessible without authentication — potential data exposure risk.',
+    'PRIVATE': 'Bucket exists but is not publicly accessible.',
+    'NEW':     'This asset was not seen in a previous scan — first time discovered.',
+    'OPENED':  'This port was closed in the previous scan and is now open — a new exposure.',
+  };
+
   function badge_html(cls, text) {
-    return '<span class="badge ' + cls + '">' + text + '</span>';
+    const tip = BADGE_TIPS[text] ? ' data-tooltip="' + BADGE_TIPS[text] + '"' : '';
+    return '<span class="badge ' + cls + '"' + tip + '>' + text + '</span>';
   }
 
   // esc prevents XSS from scan results being injected into innerHTML.
