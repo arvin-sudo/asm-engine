@@ -1423,4 +1423,92 @@ Three new tests exercise `run()` directly via `bytes.Buffer`: `TestRun_MissingTa
 | `internal/scanner/tcp_scanner.go` | `rateLimit` field; ticker token channel in `Scan`; comment bug fixed |
 | `internal/scanner/tcp_scanner_test.go` | Fourth arg on all `NewTCPScanner` calls; two new rate-limit tests |
 | `cmd/asm/main.go` | `run(w io.Writer, args []string) error` extraction; `--rate-limit` flag; `flag.NewFlagSet` |
+
+---
+
+## Final Phase — Localhost Web UI Dashboard + Sandboxed Docker Environment (2026-05-05)
+
+### What was built
+
+The engine now ships with an embedded, zero-dependency web UI accessible via `--ui`. A sandboxed Docker environment enables safe local evaluation against a deliberately vulnerable target.
+
+### Architecture: typed event channel
+
+The core design challenge was that `cmd/asm/main.go:run()` wrote formatted strings to an `io.Writer`. A web UI requires structured, typed data. The solution avoids duplicating the 500-line pipeline: a new `internal/pipeline` package introduces a typed event channel between the engine and its consumers.
+
+```
+PipelineRunner.Run(ctx, cfg) → <-chan ScanEvent
+          │
+    ┌─────┴──────────────────────────────────┐
+    │                                        │
+CLI consumer                        SSE handler
+(cmd/asm/main.go)               (internal/web/server.go)
+reads events, formats text      encodes events as JSON,
+to io.Writer (unchanged output) flushes per event via http.Flusher
+```
+
+**Why this design, not wrapping io.Writer?** Wrapping io.Writer would deliver text blobs to the frontend — unparseable for the four visual cards. Typed events let the JavaScript `EventSource` client route each event to the correct card via named `addEventListener` listeners, with no secondary parsing.
+
+### `internal/pipeline/events.go`
+
+Defines `ScanEvent{Type EventType, Payload json.RawMessage}` and all payload structs. `json.RawMessage` as the payload field means each phase marshals once; both consumers unmarshal only what they need. A `newEvent` helper panics at development time if a payload is not JSON-serialisable — it is never reachable in production.
+
+### `internal/pipeline/runner.go`
+
+`Runner` holds every concrete implementation (subdiscoverer, scanner, fingerprinters, vulnchecker, cloud scanner, store, differ). `NewRunner(cfg)` is the single instantiation point — both the CLI and the SSE handler call it. `Run(ctx, cfg)` spawns exactly one goroutine; the goroutine exits when the pipeline finishes or `ctx` is cancelled (browser tab closed). This is the only new goroutine introduced — warranted because the HTTP handler must not block.
+
+`IsLocalTarget(target)` returns true for IP addresses (`net.ParseIP`) or bare hostnames without dots (Docker service names). Local targets bypass Phases 1a–1d and build a synthetic `models.Asset` via `buildSyntheticAsset`, which tries OS DNS resolution and falls back to using the name itself so Docker bridge names resolve at scan time.
+
+### `cmd/asm/main.go` refactor
+
+`run(io.Writer, []string) error` keeps its exact signature — `main_test.go` calls it unchanged. The 500-line pipeline body is replaced by flag parsing → `pipeline.NewRunner(cfg)` → `consumeForCLI(w, events)`. `consumeForCLI` reproduces every `fmt.Fprintf` line from the original implementation by formatting events back to text; the CLI output is byte-for-byte identical to before.
+
+`main()` pre-scans `os.Args` for `--ui` before delegating to `run()`. This avoids adding `--ui` to `run()`'s `flag.FlagSet` (which would require making `--target` optional for UI mode, breaking `TestRun_MissingTarget`).
+
+### `internal/web/server.go` — SSE streaming
+
+SSE was chosen over WebSockets because it is one-directional (scan results only flow server→client), natively supported by browsers via `EventSource`, and requires no library. The `event:` field in each SSE message is set to the `EventType` string so the frontend uses `addEventListener('port', handler)` — no secondary type-switch in JavaScript.
+
+`http.Flusher.Flush()` is called after every event write. `r.Context()` is passed to `runner.Run()` — Go's HTTP server cancels it automatically when the client disconnects, propagating cancellation into the pipeline goroutine.
+
+### `internal/web/static/index.html`
+
+Single self-contained file — no build step, no node_modules, no CDN dependencies. Embedded via `//go:embed static/index.html` so the binary is fully self-contained. Four live cards:
+- **Subdomains & Assets** — `[NEW]` badge (blue) when diff detects a new domain
+- **Ports & Infrastructure** — inline CVEs, tech stack, `[OPENED]` badge (amber) for new ports
+- **Cloud Buckets** — `[PUBLIC]` (red) / `[PRIVATE]` (green) per `BucketPayload.Accessible`
+- **DNS Intelligence & Progress** — third-party service indicators + real-time phase progress
+
+All user-facing strings inserted via `innerHTML` pass through `esc()` to prevent XSS from scan results containing HTML characters.
+
+### Docker environment
+
+- `deploy/Dockerfile` — multi-stage build (`golang:1.25-alpine` → `alpine:3.20`). `CGO_ENABLED=0` produces a fully static binary; `ca-certificates` is added for HTTPS to OSINT sources. Default `CMD ["--ui"]`.
+- `deploy/docker-compose.yaml` — three services on `asm-net` bridge:
+  - `db` — PostgreSQL 16-alpine, healthcheck-gated, schema loaded from `deploy/db/init.sql`
+  - `victim-service` — nginx 1.14.0-alpine (deliberately old; exposes CVE-2019-9511/9513 for Phase 2 demo)
+  - `asm-engine` — our binary, UI on host port 8080, `depends_on: db: condition: service_healthy`
+- `deploy/db/init.sql` — schema DDL kept in sync with `internal/storage/postgres_store.go`
+
+### Test compatibility
+
+All pre-existing tests pass without modification (`go test -race ./...` green). The refactor preserved every public function signature. `parsePorts()` and `filterByIP()` remain in `cmd/asm/main.go` (package `main`) because `main_test.go` references them directly.
+
+### Files added
+
+| File | Purpose |
+|------|---------|
+| `internal/pipeline/events.go` | `ScanEvent` envelope + all payload types + `newEvent` + `emit` |
+| `internal/pipeline/runner.go` | `Config`, `Runner`, `NewRunner`, `Run`, `IsLocalTarget`, `buildSyntheticAsset` |
+| `internal/web/server.go` | `Serve`, SSE handler `handleScan`, query-param config parsing |
+| `internal/web/static/index.html` | Dark-mode SPA — four live cards, EventSource client, XSS-safe rendering |
+| `deploy/Dockerfile` | Multi-stage Go build → alpine runtime |
+| `deploy/docker-compose.yaml` | Three-service sandbox: db + victim + engine |
+| `deploy/db/init.sql` | Schema DDL for Postgres container initialisation |
+
+### Files modified
+
+| File | Change |
+|------|--------|
+| `cmd/asm/main.go` | `run()` slimmed to flag parsing + `consumeForCLI`; `main()` gains `--ui` routing; `internal/pipeline` and `internal/web` imports added |
 | `cmd/asm/main_test.go` | Three new `run()` tests |

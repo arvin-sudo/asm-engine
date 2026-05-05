@@ -1,0 +1,72 @@
+version: "3.9"
+
+# Three-service sandbox for local thesis evaluation.
+#
+# Service topology:
+#   db             — PostgreSQL 16, pre-initialised with the ASM schema
+#   victim-service — nginx 1.14.0 (deliberately old; exposes CVEs for demo)
+#   asm-engine     — our binary, UI on host port 8080
+#
+# All services share the "asm-net" bridge network so asm-engine can reach
+# victim-service by its service name: --target victim-service
+
+networks:
+  asm-net:
+    driver: bridge
+
+volumes:
+  pgdata:
+
+services:
+
+  # ── PostgreSQL persistence store ─────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    networks: [asm-net]
+    environment:
+      POSTGRES_DB:       asmdb
+      POSTGRES_USER:     asm
+      POSTGRES_PASSWORD: asm_secret
+    volumes:
+      # init.sql runs once on first container start (before asm-engine connects).
+      - ./db:/docker-entrypoint-initdb.d:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U asm -d asmdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ── Deliberately vulnerable scan target ──────────────────────────────────────
+  # nginx 1.14.0 is intentionally old. It exposes:
+  #   CVE-2019-9511 / CVE-2019-9513 (HTTP/2 DoS — CVSS 7.5)
+  # The engine fingerprints the Server header, identifies the version, and
+  # reports the CVEs — demonstrating the full Phase 2 vulnerability pipeline.
+  victim-service:
+    image: nginx:1.14.0-alpine
+    networks: [asm-net]
+    # Port 8081 on the host lets you inspect the victim page manually.
+    # asm-engine reaches it on port 80 inside the Docker network.
+    ports:
+      - "8081:80"
+    restart: unless-stopped
+
+  # ── ASM engine ───────────────────────────────────────────────────────────────
+  asm-engine:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    networks: [asm-net]
+    ports:
+      - "8080:8080"
+    environment:
+      # The UI scan form accepts a ?db= query parameter at runtime.
+      # This env var makes the DSN available inside the container so you can
+      # pass it when overriding CMD for a one-shot CLI run:
+      #   docker compose run asm-engine --target victim-service --db "$ASM_DB_DSN"
+      ASM_DB_DSN: "postgres://asm:asm_secret@db/asmdb?sslmode=disable"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped

@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DASM by Arv</title>
+  <style>
+    :root {
+      --bg:      #0d1117;
+      --surface: #161b22;
+      --surface2:#1c2128;
+      --border:  #30363d;
+      --accent:  #58a6ff;
+      --red:     #f85149;
+      --amber:   #e3b341;
+      --green:   #3fb950;
+      --text:    #c9d1d9;
+      --muted:   #8b949e;
+      --font:    'Courier New', 'Consolas', monospace;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 14px;
+      min-height: 100vh;
+    }
+
+    /* ── Header ───────────────────────────────────────────────── */
+    .header {
+      text-align: center;
+      padding: 3.5rem 1rem 2rem;
+      user-select: none;
+    }
+    .header h1 {
+      font-size: 2.6rem;
+      letter-spacing: 6px;
+      color: var(--accent);
+      font-weight: 700;
+    }
+    .header h1 span { color: var(--muted); font-weight: 400; }
+    .header p {
+      margin-top: .45rem;
+      color: var(--muted);
+      letter-spacing: 3px;
+      font-size: .8rem;
+      text-transform: uppercase;
+    }
+
+    /* ── Search bar ───────────────────────────────────────────── */
+    .search-wrap {
+      max-width: 860px;
+      margin: 0 auto 2.5rem;
+      padding: 0 1.5rem;
+      display: flex;
+      gap: .5rem;
+    }
+    .search-wrap input {
+      flex: 1;
+      padding: .8rem 1.2rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-family: var(--font);
+      font-size: .95rem;
+      outline: none;
+      transition: border-color .15s;
+    }
+    .search-wrap input:focus { border-color: var(--accent); }
+    .search-wrap input::placeholder { color: var(--muted); }
+    .search-wrap button {
+      padding: .8rem 1.6rem;
+      background: var(--accent);
+      border: none;
+      border-radius: 6px;
+      color: #0d1117;
+      font-family: var(--font);
+      font-size: .9rem;
+      font-weight: 700;
+      letter-spacing: 1px;
+      cursor: pointer;
+      transition: opacity .15s;
+    }
+    .search-wrap button:hover { opacity: .85; }
+    .search-wrap button:disabled { opacity: .45; cursor: default; }
+
+    /* ── Four-card grid ───────────────────────────────────────── */
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+      max-width: 1440px;
+      margin: 0 auto;
+      padding: 0 1.5rem 4rem;
+    }
+    @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      min-height: 320px;
+    }
+    .card-header {
+      padding: .65rem 1rem;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: .5rem;
+      background: var(--surface2);
+    }
+    .card-title {
+      font-size: .7rem;
+      letter-spacing: 2px;
+      color: var(--muted);
+      text-transform: uppercase;
+      font-weight: 700;
+    }
+    .card-count {
+      margin-left: auto;
+      font-size: .7rem;
+      color: var(--muted);
+    }
+    .card-body {
+      padding: .75rem 1rem;
+      overflow-y: auto;
+      flex: 1;
+    }
+
+    /* ── Entry rows ───────────────────────────────────────────── */
+    .entry {
+      padding: .35rem 0;
+      border-bottom: 1px solid var(--surface2);
+      font-size: .8rem;
+      line-height: 1.5;
+      word-break: break-all;
+    }
+    .entry:last-child { border-bottom: none; }
+
+    .ip   { color: var(--muted); font-size: .75rem; }
+    .svc  { color: var(--text); }
+    .ver  { color: var(--accent); }
+    .evidence { color: var(--muted); font-size: .73rem; }
+
+    /* ── Badges ───────────────────────────────────────────────── */
+    .badge {
+      display: inline-block;
+      font-size: .6rem;
+      padding: 1px 5px;
+      border-radius: 3px;
+      font-weight: 700;
+      letter-spacing: .5px;
+      vertical-align: middle;
+      margin-left: .3rem;
+    }
+    .badge-new     { background: #132032; color: var(--accent); }
+    .badge-opened  { background: #2d1f00; color: var(--amber); }
+    .badge-public  { background: #3d0014; color: var(--red); }
+    .badge-private { background: #0d2b1f; color: var(--green); }
+
+    /* ── Vulnerability lines ──────────────────────────────────── */
+    .vuln {
+      padding-left: 1.2rem;
+      font-size: .73rem;
+      line-height: 1.4;
+    }
+    .vuln-CRITICAL { color: var(--red);   }
+    .vuln-HIGH     { color: #f0883e;      }
+    .vuln-MEDIUM   { color: var(--amber); }
+    .vuln-LOW      { color: var(--muted); }
+
+    /* ── Tech stack line ──────────────────────────────────────── */
+    .tech {
+      padding-left: 1.2rem;
+      font-size: .73rem;
+      color: var(--muted);
+    }
+
+    /* ── Progress area (DNS intel card) ───────────────────────── */
+    .progress-entry {
+      padding: .28rem 0;
+      font-size: .75rem;
+      color: var(--muted);
+      border-bottom: 1px solid var(--surface2);
+    }
+    .progress-entry:last-child { border-bottom: none; }
+    .progress-done { color: var(--green); }
+    .progress-icon { margin-right: .3rem; }
+
+    /* ── Empty state ──────────────────────────────────────────── */
+    .empty {
+      color: var(--muted);
+      font-size: .8rem;
+      padding: .5rem 0;
+      font-style: italic;
+    }
+
+    /* ── Diff panel (inside Ports card) ──────────────────────── */
+    .diff-entry {
+      padding: .3rem 0;
+      font-size: .75rem;
+      border-bottom: 1px solid var(--surface2);
+    }
+    .diff-entry:last-child { border-bottom: none; }
+  </style>
+</head>
+<body>
+
+<!-- ── Header ──────────────────────────────────────────────────── -->
+<div class="header">
+  <h1>DASM <span>by Arv</span></h1>
+  <p>defensive attack surface mapping</p>
+</div>
+
+<!-- ── Search bar ──────────────────────────────────────────────── -->
+<div class="search-wrap">
+  <input id="target" type="text"
+    placeholder="example.com  ·  192.168.1.1  ·  victim-container"
+    autocomplete="off" spellcheck="false" />
+  <button id="scanBtn">SCAN</button>
+</div>
+
+<!-- ── Four-card grid ──────────────────────────────────────────── -->
+<div class="grid">
+
+  <!-- Card 1: Subdomains & Assets -->
+  <div class="card">
+    <div class="card-header">
+      <span class="card-title">Subdomains &amp; Assets</span>
+      <span class="card-count" id="count-sub">0</span>
+    </div>
+    <div class="card-body" id="list-sub">
+      <div class="empty" id="empty-sub">Waiting for scan...</div>
+    </div>
+  </div>
+
+  <!-- Card 2: Ports & Infrastructure -->
+  <div class="card">
+    <div class="card-header">
+      <span class="card-title">Ports &amp; Infrastructure</span>
+      <span class="card-count" id="count-port">0</span>
+    </div>
+    <div class="card-body" id="list-port">
+      <div class="empty" id="empty-port">Waiting for scan...</div>
+    </div>
+  </div>
+
+  <!-- Card 3: Cloud Buckets -->
+  <div class="card">
+    <div class="card-header">
+      <span class="card-title">Cloud Buckets</span>
+      <span class="card-count" id="count-bucket">0</span>
+    </div>
+    <div class="card-body" id="list-bucket">
+      <div class="empty" id="empty-bucket">Waiting for scan...</div>
+    </div>
+  </div>
+
+  <!-- Card 4: DNS Intelligence + Phase Progress -->
+  <div class="card">
+    <div class="card-header">
+      <span class="card-title">DNS Intelligence &amp; Progress</span>
+      <span class="card-count" id="count-dns">0</span>
+    </div>
+    <div class="card-body" id="list-dns">
+      <div class="empty" id="empty-dns">Waiting for scan...</div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  /* ── State ──────────────────────────────────────────────── */
+  let source   = null;
+  let counts   = { sub: 0, port: 0, bucket: 0, dns: 0 };
+  let scanning = false;
+
+  /* ── DOM refs ───────────────────────────────────────────── */
+  const input   = document.getElementById('target');
+  const btn     = document.getElementById('scanBtn');
+
+  /* ── Bind interactions ──────────────────────────────────── */
+  btn.addEventListener('click', startScan);
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') startScan(); });
+
+  /* ── Start / reset ──────────────────────────────────────── */
+  function startScan() {
+    const target = input.value.trim();
+    if (!target || scanning) return;
+
+    // Close any previous stream
+    if (source) { source.close(); source = null; }
+
+    // Clear all cards
+    ['sub', 'port', 'bucket', 'dns'].forEach(id => {
+      document.getElementById('list-' + id).innerHTML =
+        '<div class="empty" id="empty-' + id + '">Scanning...</div>';
+      counts[id] = 0;
+      document.getElementById('count-' + id).textContent = '0';
+    });
+
+    scanning = true;
+    btn.disabled = true;
+    btn.textContent = 'SCANNING';
+
+    const url = '/scan?target=' + encodeURIComponent(target);
+    source = new EventSource(url);
+
+    // Named SSE event listeners — one per EventType constant in events.go.
+    // Using addEventListener('port', ...) instead of onmessage avoids routing
+    // all events through a single handler and a secondary type-switch in JS.
+    source.addEventListener('subdomain',      e => onSubdomain(payload(e)));
+    source.addEventListener('port',           e => onPort(payload(e)));
+    source.addEventListener('bucket',         e => onBucket(payload(e)));
+    source.addEventListener('dns_indicator',  e => onDNSIndicator(payload(e)));
+    source.addEventListener('phase_start',    e => onPhase(payload(e), false));
+    source.addEventListener('phase_complete', e => onPhase(payload(e), true));
+    source.addEventListener('diff',           e => onDiff(payload(e)));
+    source.addEventListener('error_event',    e => onPhase({ message: 'Error: ' + (payload(e).message || '') }, false));
+    source.addEventListener('done',           () => onDone());
+
+    source.onerror = () => {
+      addProgress('Connection closed.', false);
+      finishScan();
+    };
+  }
+
+  /* ── Payload extraction ─────────────────────────────────── */
+  // The Go server sends: data: {"type":"...","payload":{...}}
+  // e.data is that JSON string. envelope.payload is already a JS object
+  // because json.RawMessage serialises as inline JSON, not a quoted string.
+  function payload(e) {
+    try {
+      const env = JSON.parse(e.data);
+      // Guard: if payload is somehow a string, parse it.
+      return (typeof env.payload === 'string') ? JSON.parse(env.payload) : env.payload;
+    } catch (_) { return {}; }
+  }
+
+  /* ── Card 1: Subdomains & Assets ────────────────────────── */
+  function onSubdomain(p) {
+    clearEmpty('sub');
+    const div = document.createElement('div');
+    div.className = 'entry';
+
+    let badge = '';
+    if (p.diff_kind === 'NEW ASSET') badge = badge_html('badge-new', 'NEW');
+
+    let ips = '';
+    if (p.ips && p.ips.length) {
+      ips = ' <span class="ip">' + esc(p.ips.join(', ')) + '</span>';
+    }
+
+    let label = '';
+    switch (p.status) {
+      case 'dead':        label = '<span style="color:var(--muted)">[dead] </span>'; break;
+      case 'wildcard':    label = '<span style="color:var(--amber)">[wildcard] </span>'; break;
+      case 'ptr_live':    label = '<span style="color:var(--green)">[ptr] </span>'; break;
+      case 'ptr_dead':    label = '<span style="color:var(--muted)">[ptr-dead] </span>'; break;
+      case 'ptr_wildcard':label = '<span style="color:var(--amber)">[ptr-wildcard] </span>'; break;
+    }
+
+    div.innerHTML = label + '<strong>' + esc(p.name) + '</strong>' + badge + ips;
+    document.getElementById('list-sub').appendChild(div);
+    tick('sub');
+  }
+
+  /* ── Card 2: Ports & Infrastructure ────────────────────── */
+  function onPort(p) {
+    clearEmpty('port');
+    const wrap = document.createElement('div');
+    wrap.className = 'entry';
+
+    let badge = '';
+    if (p.diff_kind === 'PORT OPENED') badge = badge_html('badge-opened', 'OPENED');
+
+    let svcLine = '';
+    if (p.service_name) {
+      svcLine = ' <span class="svc">' + esc(p.service_name) + '</span>';
+      if (p.service_version) svcLine += ' <span class="ver">' + esc(p.service_version) + '</span>';
+    } else {
+      svcLine = ' <span style="color:var(--muted)">open</span>';
+    }
+
+    let html = '<span style="color:var(--accent)">' + esc(p.domain) + '</span>'
+      + ' <span class="ip">' + esc(p.ip) + ':' + p.port + '/' + esc(p.proto) + '</span>'
+      + svcLine + badge;
+
+    // Vulnerabilities
+    if (p.vulnerabilities && p.vulnerabilities.length) {
+      p.vulnerabilities.forEach(v => {
+        const id = v.cve ? '[' + esc(v.cve) + '] ' : '';
+        html += '<div class="vuln vuln-' + esc(v.severity) + '">'
+          + id + esc(v.description) + '</div>';
+      });
+    }
+
+    // Technologies
+    if (p.technologies && p.technologies.length) {
+      const names = p.technologies.map(t =>
+        t.category ? esc(t.name) + ' <span style="color:var(--border)">(' + esc(t.category) + ')</span>'
+                   : esc(t.name)
+      ).join(', ');
+      html += '<div class="tech">Tech: ' + names + '</div>';
+    }
+
+    wrap.innerHTML = html;
+    document.getElementById('list-port').appendChild(wrap);
+    tick('port');
+  }
+
+  /* ── Card 3: Cloud Buckets ──────────────────────────────── */
+  function onBucket(p) {
+    clearEmpty('bucket');
+    const div = document.createElement('div');
+    div.className = 'entry';
+
+    const badgeCls = p.accessible ? 'badge-public'  : 'badge-private';
+    const badgeTxt = p.accessible ? 'PUBLIC'         : 'PRIVATE';
+
+    div.innerHTML = '<a href="' + esc(p.url) + '" target="_blank" rel="noopener"'
+      + ' style="color:var(--accent)">' + esc(p.url) + '</a>'
+      + badge_html(badgeCls, badgeTxt)
+      + ' <span class="ip">' + esc(p.provider) + '</span>';
+
+    document.getElementById('list-bucket').appendChild(div);
+    tick('bucket');
+  }
+
+  /* ── Card 4a: DNS Intel ─────────────────────────────────── */
+  function onDNSIndicator(p) {
+    clearEmpty('dns');
+    const div = document.createElement('div');
+    div.className = 'entry';
+    div.innerHTML = '<span style="color:var(--accent)">[' + esc(p.record) + ']</span> '
+      + '<strong>' + esc(p.service) + '</strong>'
+      + ' <span class="evidence">' + esc(p.evidence) + '</span>';
+    document.getElementById('list-dns').appendChild(div);
+    tick('dns');
+  }
+
+  /* ── Card 4b: Phase progress ────────────────────────────── */
+  function onPhase(p, done) {
+    addProgress(p.message || '', done);
+  }
+
+  function addProgress(msg, done) {
+    clearEmpty('dns');
+    const div = document.createElement('div');
+    div.className = 'progress-entry' + (done ? ' progress-done' : '');
+    div.innerHTML = '<span class="progress-icon">' + (done ? '✓' : '›') + '</span>' + esc(msg);
+    document.getElementById('list-dns').appendChild(div);
+    // Auto-scroll progress to bottom
+    const body = document.getElementById('list-dns');
+    body.scrollTop = body.scrollHeight;
+  }
+
+  /* ── Diff events (port open/close, version change, new asset) ── */
+  function onDiff(p) {
+    const div = document.createElement('div');
+    div.className = 'diff-entry';
+
+    let html = badge_html('badge-opened', esc(p.kind)) + ' ';
+    switch (p.kind) {
+      case 'NEW ASSET':
+        html += esc(p.domain);
+        break;
+      case 'PORT OPENED':
+      case 'PORT CLOSED':
+        html += esc(p.domain) + ' ' + esc(p.ip) + ':' + p.port + '/' + esc(p.proto);
+        break;
+      case 'VERSION CHANGE':
+        html += esc(p.service_name) + ' '
+          + '<span style="color:var(--muted)">' + esc(p.old_version) + '</span>'
+          + ' → <span style="color:var(--green)">' + esc(p.new_version) + '</span>'
+          + ' <span class="ip">on ' + esc(p.ip) + ':' + p.port + '</span>';
+        break;
+    }
+
+    div.innerHTML = html;
+    // Diff events go into the Ports card where they are most visible.
+    const portList = document.getElementById('list-port');
+    portList.appendChild(div);
+  }
+
+  /* ── Done ───────────────────────────────────────────────── */
+  function onDone() {
+    addProgress('Scan complete.', true);
+    finishScan();
+  }
+
+  function finishScan() {
+    scanning = false;
+    btn.disabled = false;
+    btn.textContent = 'SCAN';
+    if (source) { source.close(); source = null; }
+  }
+
+  /* ── Helpers ────────────────────────────────────────────── */
+  function clearEmpty(id) {
+    const el = document.getElementById('empty-' + id);
+    if (el) el.remove();
+  }
+
+  function tick(id) {
+    counts[id]++;
+    document.getElementById('count-' + id).textContent = counts[id];
+  }
+
+  function badge_html(cls, text) {
+    return '<span class="badge ' + cls + '">' + text + '</span>';
+  }
+
+  // esc prevents XSS from scan results being injected into innerHTML.
+  // Only used for user-visible strings inserted via innerHTML; hrefs are
+  // passed through esc as well since URLs come from the scanner, not the user.
+  function esc(s) {
+    if (s == null) return '';
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+})();
+</script>
+</body>
+</html>
