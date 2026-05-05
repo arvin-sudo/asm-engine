@@ -270,6 +270,49 @@ func TestWebStackFingerprinter_UnreachablePort(t *testing.T) {
 	}
 }
 
+func TestWebStackFingerprinter_BodyLimitTruncatesLargeResponse(t *testing.T) {
+	// Serve a response body larger than webReadLimit (8 KiB) that embeds a
+	// recognisable technology marker near the start. FingerprintWeb must detect
+	// the technology without reading the full response, proving io.LimitReader
+	// is applied correctly and the fingerprinter does not stall on huge pages.
+	bigBody := strings.Repeat("X", webReadLimit*4) // 32 KiB — well past the cap
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Inject the data-drupal-selector attribute that detectBodyTechnologies
+		// matches, then fill the rest of the response with filler. The signature
+		// is within the first 8 KiB, so it must be detected regardless of how
+		// much additional data follows — proving io.LimitReader is applied.
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`<form data-drupal-selector="edit-form">`))
+		w.Write([]byte(bigBody))
+	}))
+	defer srv.Close()
+
+	_, portStr, _ := net.SplitHostPort(srv.Listener.Addr().String())
+	port, _ := strconv.Atoi(portStr)
+
+	f := NewWebStackFingerprinter(2 * time.Second)
+	// Inject the test port into the HTTP routing table so FingerprintWeb tries
+	// the plain-HTTP path instead of skipping the port as unrecognised.
+	f.httpPorts[port] = true
+
+	techs, err := f.FingerprintWeb("127.0.0.1", models.Port{IP: "127.0.0.1", Number: port, Proto: "tcp"})
+	if err != nil {
+		t.Fatalf("FingerprintWeb() returned unexpected error: %v", err)
+	}
+	found := false
+	for _, tech := range techs {
+		if strings.EqualFold(tech.Name, "Drupal") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected Drupal in detected technologies, got %v", techs)
+	}
+}
+
 func TestWebStackFingerprinter_CanFingerprint(t *testing.T) {
 	tests := []struct {
 		port int

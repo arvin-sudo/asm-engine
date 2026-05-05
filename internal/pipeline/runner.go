@@ -65,6 +65,19 @@ type Runner struct {
 	differ        *analysis.Differ // nil when store == nil
 }
 
+// DefaultPorts is the set of TCP ports probed when the caller does not specify
+// a custom port list. It is defined here — rather than in cmd/ or web/ — so
+// both consumers share a single source of truth without importing each other.
+//
+// The selection covers services most commonly exposed on an external attack
+// surface: web servers, SSH, database engines, remote desktop, and popular
+// NoSQL stores. Deliberately narrower than nmap's top-1000 list; the goal is
+// fast, signal-rich output rather than exhaustive enumeration.
+var DefaultPorts = []int{
+	21, 22, 23, 25, 53, 80, 110, 143, 443, 445,
+	993, 995, 1433, 3306, 3389, 5432, 6379, 8080, 8443, 8888, 27017,
+}
+
 // webServiceNames is the set of service names for which web technology
 // fingerprinting is attempted. Duplicated from main.go so the Runner is
 // self-contained and main.go can delegate completely.

@@ -326,7 +326,7 @@
     source.addEventListener('phase_start',    e => onPhase(payload(e), false));
     source.addEventListener('phase_complete', e => onPhase(payload(e), true));
     source.addEventListener('diff',           e => onDiff(payload(e)));
-    source.addEventListener('error_event',    e => onPhase({ message: 'Error: ' + (payload(e).message || '') }, false));
+    source.addEventListener('error',           e => onPhase({ message: 'Error: ' + (payload(e).message || '') }, false));
     source.addEventListener('done',           () => onDone());
 
     source.onerror = () => {

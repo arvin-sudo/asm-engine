@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -67,7 +68,11 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write(indexHTML)
+	if _, err := w.Write(indexHTML); err != nil {
+		// The client disconnected before the full page was delivered.
+		// Nothing meaningful can be sent in response — log and return.
+		log.Printf("web: serveIndex: write: %v", err)
+	}
 }
 
 // handleScan is the SSE endpoint. It reads ?target=<domain> from the query
@@ -121,7 +126,11 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 		//   data: <json>\n
 		//   \n
 		// The blank line terminates the event and triggers dispatch in the browser.
-		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", e.Type, b)
+		// A write error means the client disconnected — stop streaming immediately
+		// rather than burning CPU finishing a scan nobody receives.
+		if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", e.Type, b); err != nil {
+			return
+		}
 		flusher.Flush()
 
 		// Check for client disconnect between events to avoid writing into a
@@ -159,39 +168,23 @@ func buildConfig(r *http.Request, target string) pipeline.Config {
 // the handler exits cleanly. The client receives the error in the same stream
 // rather than an HTTP error status, which would prevent EventSource from
 // reading it.
+//
+// The payload is constructed by marshalling an ErrorPayload struct — the same
+// path every other event takes — so the output is guaranteed well-formed JSON
+// without manual escaping.
 func writeSSEError(w http.ResponseWriter, flusher http.Flusher, msg string) {
+	payload, _ := json.Marshal(pipeline.ErrorPayload{Phase: "init", Message: msg})
 	b, _ := json.Marshal(pipeline.ScanEvent{
 		Type:    pipeline.EventError,
-		Payload: jsonString(`{"phase":"init","message":"` + jsonEscape(msg) + `"}`),
+		Payload: payload,
 	})
 	fmt.Fprintf(w, "event: error\ndata: %s\n\n", b)
 	flusher.Flush()
 }
 
-// jsonString converts a raw JSON string literal to json.RawMessage so it can
-// be embedded in ScanEvent.Payload without double-encoding.
-func jsonString(s string) []byte {
-	return []byte(s)
-}
-
-// jsonEscape returns s with double-quotes and backslashes escaped for safe
-// embedding inside a JSON string value.
-func jsonEscape(s string) string {
-	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, `"`, `\"`)
-	return s
-}
-
-// defaultPorts mirrors the list in cmd/asm/main.go. Duplicated here so the
-// web package is self-contained and does not import the cmd package.
-var defaultPorts = []int{
-	21, 22, 23, 25, 53, 80, 110, 143, 443, 445,
-	993, 995, 1433, 3306, 3389, 5432, 6379, 8080, 8443, 8888, 27017,
-}
-
 func parsePorts(s string) []int {
 	if strings.TrimSpace(s) == "" {
-		return defaultPorts
+		return pipeline.DefaultPorts
 	}
 	var ports []int
 	seen := make(map[int]struct{})
@@ -207,7 +200,7 @@ func parsePorts(s string) []int {
 		ports = append(ports, n)
 	}
 	if len(ports) == 0 {
-		return defaultPorts
+		return pipeline.DefaultPorts
 	}
 	return ports
 }

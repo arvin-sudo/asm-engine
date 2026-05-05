@@ -1512,3 +1512,52 @@ All pre-existing tests pass without modification (`go test -race ./...` green). 
 |------|--------|
 | `cmd/asm/main.go` | `run()` slimmed to flag parsing + `consumeForCLI`; `main()` gains `--ui` routing; `internal/pipeline` and `internal/web` imports added |
 | `cmd/asm/main_test.go` | Three new `run()` tests |
+
+---
+
+## Hardening & Audit Pass (2026-05-06)
+
+Full codebase audit via three parallel review agents. All issues confirmed by direct file reads before fixing.
+
+### Bugs fixed
+
+| File | Bug | Fix |
+|------|-----|-----|
+| `internal/web/static/index.html:329` | JS listener used `'error_event'` but Go emits `EventError = "error"` — every non-fatal pipeline warning was silently dropped in the browser | Changed listener to `'error'` |
+| `cmd/asm/main.go` | CLI mode passed `context.Background()` to `runner.Run()` — Ctrl+C left the scan goroutine running | Added `signal.NotifyContext(os.Interrupt)` in `main()`; propagated `ctx` through new `run(ctx, w, args)` signature |
+| `internal/web/server.go:writeSSEError` | Manually constructed JSON payload via string concatenation and `jsonEscape()` helper — inconsistent with every other event path and brittle | Replaced with `json.Marshal(pipeline.ErrorPayload{...})` + `json.Marshal(pipeline.ScanEvent{...})`; removed `jsonString` and `jsonEscape` helpers |
+| `internal/web/server.go:serveIndex` | `w.Write(indexHTML)` error ignored — silent failure on client disconnect | Added error check with `log.Printf` |
+| `internal/web/server.go:handleScan` | `fmt.Fprintf(w, ...)` error ignored in SSE loop — continued writing to a closed connection | Return from loop immediately on write error |
+
+### Refactoring
+
+**`DefaultPorts` extracted to `internal/pipeline`**
+
+The default port list was defined identically in both `cmd/asm/main.go` and `internal/web/server.go`. It is now a single exported `pipeline.DefaultPorts` variable. Both files import `pipeline` already; the comment explaining the deliberate duplication is no longer needed.
+
+**Service name constants in `internal/vulndb`**
+
+Magic string literals (`"openssh"`, `"apache"`, `"nginx"`, etc.) in `load()` replaced with exported constants (`ServiceOpenSSH`, `ServiceApache`, …). Provides a single grep-able reference point between the fingerprinter output names and the CVE rule keys — if a service is ever renamed, the constant name makes the coupling explicit and compile-time checkable.
+
+### Tests added
+
+Three packages previously had zero test files. All new tests are table-driven, use `t.Run`, and live in the same package as the code under test.
+
+| File | Test functions |
+|------|----------------|
+| `internal/pipeline/runner_test.go` | `TestIsLocalTarget`, `TestBuildSyntheticAsset_IPAddress`, `TestBuildSyntheticAsset_IPv6`, `TestEmit_SendsOnBufferedChannel`, `TestEmit_DropsWhenChannelFull`, `TestNewEvent_AllPayloadTypes`, `TestRun_LocalTarget`, `TestRun_ContextCancellation` |
+| `internal/web/server_test.go` | `TestParsePorts_*`, `TestParseInt`, `TestParseDuration`, `TestBuildConfig_*`, `TestServeIndex_*`, `TestHandleScan_MissingTarget` |
+| `internal/scanner/tcp_scanner_test.go` | `TestTCPScanner_Scan_ZeroPorts` (added to existing file) |
+| `internal/fingerprint/web_stack_fingerprinter_test.go` | `TestWebStackFingerprinter_BodyLimitTruncatesLargeResponse` (added to existing file) |
+
+**`TestRun_LocalTarget`** constructs a `Runner` directly with inline mocks (same-package access to unexported fields), sets `IsLocal=true` to bypass all OSINT network calls, and asserts the channel closes with `EventDone` as the last event.
+
+**`TestRun_ContextCancellation`** cancels the context before calling `Run()` and asserts the goroutine exits within 5 seconds — verifying no goroutine leak on early cancellation.
+
+**`TestWebStackFingerprinter_BodyLimitTruncatesLargeResponse`** serves a 32 KiB HTTP response containing a `data-drupal-selector` attribute in the first few bytes. Detection succeeds, proving `io.LimitReader` caps the read without preventing detection of content within the limit.
+
+### Verification
+
+`go test -race -count=1 ./...` — all packages pass, zero race conditions.
+`go vet ./...` — zero diagnostics.
+`go build ./...` — clean.

@@ -2,15 +2,17 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"strings"
 	"testing"
 
+	"github.com/arvin-sudo/asm-engine/internal/pipeline"
 	"github.com/arvin-sudo/asm-engine/pkg/models"
 )
 
 func TestRun_MissingTarget(t *testing.T) {
 	var buf bytes.Buffer
-	err := run(&buf, []string{})
+	err := run(context.Background(), &buf, []string{})
 	if err == nil {
 		t.Fatal("run() expected error when --target is absent, got nil")
 	}
@@ -21,7 +23,7 @@ func TestRun_MissingTarget(t *testing.T) {
 
 func TestRun_InvalidPorts(t *testing.T) {
 	var buf bytes.Buffer
-	err := run(&buf, []string{"--target", "example.com", "--ports", "abc"})
+	err := run(context.Background(), &buf, []string{"--target", "example.com", "--ports", "abc"})
 	if err == nil {
 		t.Fatal("run() expected error for invalid --ports, got nil")
 	}
@@ -33,7 +35,7 @@ func TestRun_InvalidPorts(t *testing.T) {
 func TestRun_HelpFlag(t *testing.T) {
 	// --help should exit cleanly (nil error) — it is not a failure condition.
 	var buf bytes.Buffer
-	err := run(&buf, []string{"--help"})
+	err := run(context.Background(), &buf, []string{"--help"})
 	if err != nil {
 		t.Errorf("run(--help) returned error %v, want nil", err)
 	}
@@ -44,8 +46,8 @@ func TestParsePorts_DefaultsOnEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parsePorts(\"\") error = %v", err)
 	}
-	if len(ports) != len(defaultPorts) {
-		t.Errorf("got %d ports, want %d (default list)", len(ports), len(defaultPorts))
+	if len(ports) != len(pipeline.DefaultPorts) {
+		t.Errorf("got %d ports, want %d (default list)", len(ports), len(pipeline.DefaultPorts))
 	}
 }
 
@@ -54,8 +56,8 @@ func TestParsePorts_DefaultsOnWhitespace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parsePorts(whitespace) error = %v", err)
 	}
-	if len(ports) != len(defaultPorts) {
-		t.Errorf("got %d ports, want %d (default list)", len(ports), len(defaultPorts))
+	if len(ports) != len(pipeline.DefaultPorts) {
+		t.Errorf("got %d ports, want %d (default list)", len(ports), len(pipeline.DefaultPorts))
 	}
 }
 

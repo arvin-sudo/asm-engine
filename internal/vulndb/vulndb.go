@@ -67,6 +67,21 @@ type VulnDB struct {
 	rules map[string][]vulnRule
 }
 
+// Service name constants mirror the Name values produced by the fingerprinter
+// for each protocol. Defining them here creates a single, searchable reference
+// point: if the fingerprinter ever renames a service, a grep for the constant
+// immediately surfaces every rule that needs updating.
+const (
+	ServiceOpenSSH = "openssh"
+	ServiceApache  = "apache"
+	ServiceNginx   = "nginx"
+	ServiceSMTP    = "smtp"
+	ServiceFTP     = "ftp"
+	ServiceIMAP    = "imap"
+	ServicePOP3    = "pop3"
+	ServiceHTTP    = "http"
+)
+
 // New constructs a VulnDB loaded with the built-in CVE dataset.
 func New() *VulnDB {
 	db := &VulnDB{rules: make(map[string][]vulnRule)}
@@ -82,7 +97,7 @@ func New() *VulnDB {
 // is left empty.
 func (v *VulnDB) load() {
 	// --- OpenSSH ---
-	v.add("openssh", vulnRule{
+	v.add(ServiceOpenSSH, vulnRule{
 		// regreSSHion: signal handler race condition in sshd.
 		// Introduced in OpenSSH 8.5p1 when a fix for CVE-2006-5051 was
 		// accidentally reverted. Allows unauthenticated RCE as root on
@@ -96,7 +111,7 @@ func (v *VulnDB) load() {
 				"in sshd (affects 8.5p1–9.7p1, patched in 9.8p1)",
 		},
 	})
-	v.add("openssh", vulnRule{
+	v.add(ServiceOpenSSH, vulnRule{
 		// Username enumeration: timing side-channel in the authentication
 		// failure path leaks whether an account exists.
 		maxVersion: "7.6",
@@ -108,7 +123,7 @@ func (v *VulnDB) load() {
 	})
 
 	// --- Apache httpd ---
-	v.add("apache", vulnRule{
+	v.add(ServiceApache, vulnRule{
 		// Path traversal: %2e%2e%2f sequences bypass access controls, allowing
 		// unauthenticated read of arbitrary files and, with mod_cgi enabled, RCE.
 		// Only affects 2.4.49. A variant (CVE-2021-42013) extends to 2.4.50.
@@ -120,7 +135,7 @@ func (v *VulnDB) load() {
 			Description: "path traversal + unauthenticated RCE via %2e%2e%2f sequences (2.4.49–2.4.50 only)",
 		},
 	})
-	v.add("apache", vulnRule{
+	v.add(ServiceApache, vulnRule{
 		// Buffer overflow: a crafted request body triggers a heap buffer overflow
 		// in mod_lua, crashing the worker process. Affects all 2.4.x before 2.4.52.
 		maxVersion: "2.4.51",
@@ -132,7 +147,7 @@ func (v *VulnDB) load() {
 	})
 
 	// --- nginx ---
-	v.add("nginx", vulnRule{
+	v.add(ServiceNginx, vulnRule{
 		// Off-by-one write in the DNS resolver: a specially crafted DNS CNAME
 		// response can corrupt one byte of heap memory. Exploitable for code
 		// execution in specific configurations.
@@ -145,7 +160,7 @@ func (v *VulnDB) load() {
 	})
 
 	// --- SMTP / Postfix ---
-	v.add("smtp", vulnRule{
+	v.add(ServiceSMTP, vulnRule{
 		// SMTP smuggling: inconsistent line-ending handling allows injecting
 		// commands into an SMTP session, enabling spoofed email from trusted domains.
 		// Affects Postfix < 3.5.23, 3.6.x < 3.6.17, 3.7.x < 3.7.17, etc.
@@ -159,7 +174,7 @@ func (v *VulnDB) load() {
 	})
 
 	// --- FTP / ProFTPD ---
-	v.add("ftp", vulnRule{
+	v.add(ServiceFTP, vulnRule{
 		// Terrapin attack: prefix truncation in the SSH handshake allows
 		// downgrading negotiated algorithms. ProFTPD uses embedded SSH-like
 		// mechanisms in SFTP mode — older builds share the vulnerability.
@@ -176,7 +191,7 @@ func (v *VulnDB) load() {
 	// version-gated rules would never fire. These entries use an empty maxVersion
 	// to match any version — they serve as informational notes rather than
 	// precise version checks.
-	v.add("imap", vulnRule{
+	v.add(ServiceIMAP, vulnRule{
 		maxVersion: "",
 		vuln: models.Vulnerability{
 			CVE:         "CVE-2024-23184",
@@ -184,7 +199,7 @@ func (v *VulnDB) load() {
 			Description: "excessive resource allocation via malformed address headers in Dovecot (pre-2.3.21)",
 		},
 	})
-	v.add("pop3", vulnRule{
+	v.add(ServicePOP3, vulnRule{
 		maxVersion: "",
 		vuln: models.Vulnerability{
 			CVE:         "CVE-2024-23184",
@@ -194,7 +209,7 @@ func (v *VulnDB) load() {
 	})
 
 	// --- Generic HTTP (informational) ---
-	v.add("http", vulnRule{
+	v.add(ServiceHTTP, vulnRule{
 		// Not a CVE — a configuration note. Plain HTTP transmits credentials and
 		// session tokens in clear text; any network observer can intercept them.
 		maxVersion: "",

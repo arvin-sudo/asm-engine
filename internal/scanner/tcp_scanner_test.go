@@ -162,3 +162,19 @@ func TestNewTCPScanner_NegativeRateLimitClampedToZero(t *testing.T) {
 		t.Errorf("rateLimit = %d, want 0 after clamping negative value", s.rateLimit)
 	}
 }
+
+func TestTCPScanner_Scan_ZeroPorts(t *testing.T) {
+	// An empty port list means total == 0; Scan must return (nil, nil) without
+	// spawning channels or goroutines. This exercises the early-return guard at
+	// the top of Scan so callers can pass an empty list without crashing.
+	s := NewTCPScanner([]int{}, time.Second, 1, 0)
+	asset := models.Asset{Domain: "localhost", IPs: []string{"127.0.0.1"}}
+
+	got, err := s.Scan(asset)
+	if err != nil {
+		t.Fatalf("Scan() with zero ports returned error %v, want nil", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("Scan() with zero ports returned %d ports, want 0", len(got))
+	}
+}

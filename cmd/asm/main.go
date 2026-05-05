@@ -31,16 +31,6 @@ import (
 	"github.com/arvin-sudo/asm-engine/pkg/models"
 )
 
-// defaultPorts is the set of TCP ports probed when --ports is not specified.
-//
-// The selection covers services most commonly exposed on an external attack
-// surface: web servers, SSH, database engines, remote desktop, and popular
-// NoSQL stores. This is deliberately narrower than nmap's top-1000 list —
-// the goal is fast, signal-rich output rather than exhaustive enumeration.
-var defaultPorts = []int{
-	21, 22, 23, 25, 53, 80, 110, 143, 443, 445,
-	993, 995, 1433, 3306, 3389, 5432, 6379, 8080, 8443, 8888, 27017,
-}
 
 // main is the CLI entry point. It pre-scans os.Args for --ui before
 // delegating to run so that the FlagSet in run() never sees an unknown flag.
@@ -62,7 +52,9 @@ func main() {
 		}
 	}
 
-	if err := run(os.Stdout, os.Args[1:]); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	if err := run(ctx, os.Stdout, os.Args[1:]); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -72,7 +64,11 @@ func main() {
 // configuration errors are returned; non-fatal pipeline errors (e.g. a single
 // failed store write) are logged to stderr via log.Printf so they do not
 // interrupt the scan.
-func run(w io.Writer, args []string) error {
+//
+// ctx is propagated into the pipeline so that SIGINT (from main) or test
+// cancellation stops the scan goroutine cleanly rather than leaving it running
+// until natural completion.
+func run(ctx context.Context, w io.Writer, args []string) error {
 	fs := flag.NewFlagSet("asm-engine", flag.ContinueOnError)
 	// Usage and flag-parse errors go to stderr; scan output goes to w.
 	fs.SetOutput(os.Stderr)
@@ -126,7 +122,7 @@ func run(w io.Writer, args []string) error {
 	}
 	defer runner.Close()
 
-	return consumeForCLI(w, runner.Run(context.Background(), cfg))
+	return consumeForCLI(w, runner.Run(ctx, cfg))
 }
 
 // consumeForCLI reads events from the pipeline channel and writes the same
@@ -255,7 +251,7 @@ func consumeForCLI(w io.Writer, events <-chan pipeline.ScanEvent) error {
 // same port twice on the same host produces redundant output without any benefit.
 func parsePorts(s string) ([]int, error) {
 	if strings.TrimSpace(s) == "" {
-		return defaultPorts, nil
+		return pipeline.DefaultPorts, nil
 	}
 	parts := strings.Split(s, ",")
 	seen := make(map[int]struct{}, len(parts))
