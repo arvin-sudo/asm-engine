@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -44,11 +45,16 @@ func NewWayBackDiscoverer(client HTTPClient) *WayBackDiscoverer {
 // Discover queries the Wayback Machine CDX API for all archived URLs under
 // domain, extracts unique hostnames, and returns them scoped to domain.
 //
+// ctx is embedded in the outbound request via http.NewRequestWithContext so
+// that pipeline cancellation aborts the in-flight connection. The CDX API can
+// be slow for large archive histories; without ctx propagation the goroutine
+// would block until the client's own timeout fires even after the scan is done.
+//
 // The CDX API returns a JSON array of string arrays. The first element is a
 // header row (["original"]); each subsequent element is a one-field array
 // holding an archived URL. Hostnames are parsed from each URL using net/url
 // so that ports, paths, and query strings are stripped correctly.
-func (d *WayBackDiscoverer) Discover(domain string) ([]models.Subdomain, error) {
+func (d *WayBackDiscoverer) Discover(ctx context.Context, domain string) ([]models.Subdomain, error) {
 	// url=*.domain captures all subdomains ever archived.
 	// fl=original restricts the response to just the URL field, minimising
 	// response size. collapse=urlkey deduplicates by URL key before the
@@ -62,7 +68,11 @@ func (d *WayBackDiscoverer) Discover(domain string) ([]models.Subdomain, error) 
 	params.Set("limit", "10000")
 	endpoint := waybackBase + "?" + params.Encode()
 
-	resp, err := d.client.Get(endpoint)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("wayback_discoverer: build request: %w", err)
+	}
+	resp, err := d.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("wayback_discoverer: request failed: %w", err)
 	}
@@ -92,7 +102,6 @@ func (d *WayBackDiscoverer) Discover(domain string) ([]models.Subdomain, error) 
 // characters that naive splitting would mishandle.
 func parseWayBackRecords(records [][]string, targetDomain, source string) []models.Subdomain {
 	target := strings.ToLower(strings.TrimSpace(targetDomain))
-	seen := make(map[string]struct{})
 	var result []models.Subdomain
 
 	for i, record := range records {
@@ -111,17 +120,10 @@ func parseWayBackRecords(records [][]string, targetDomain, source string) []mode
 		// u.Hostname() strips a port number if present ("host:8080" → "host"),
 		// which net/url handles correctly regardless of IPv6 brackets.
 		name := strings.ToLower(u.Hostname())
-		if name == "" {
+		if name == "" || !inScope(name, target) {
 			continue
 		}
-		if !inScope(name, target) {
-			continue
-		}
-		if _, ok := seen[name]; ok {
-			continue
-		}
-		seen[name] = struct{}{}
 		result = append(result, models.Subdomain{Name: name, Source: source})
 	}
-	return result
+	return deduplicateSubdomains(result)
 }

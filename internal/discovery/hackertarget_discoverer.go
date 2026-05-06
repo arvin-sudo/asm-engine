@@ -2,6 +2,7 @@ package discovery
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -45,6 +46,10 @@ func NewHackerTargetDiscoverer(client HTTPClient) *HackerTargetDiscoverer {
 
 // Discover queries HackerTarget for all known subdomains of domain.
 //
+// ctx is embedded in the outbound request via http.NewRequestWithContext so
+// that pipeline cancellation (Ctrl+C, client disconnect) aborts the in-flight
+// connection without waiting for HackerTarget to respond.
+//
 // The response body is consumed line-by-line with bufio.Scanner rather than
 // buffered in full with io.ReadAll. CT and WayBack both stream-decode their
 // responses; HackerTarget now matches that pattern, keeping peak memory
@@ -53,10 +58,14 @@ func NewHackerTargetDiscoverer(client HTTPClient) *HackerTargetDiscoverer {
 // A 429 response is treated as an empty result rather than an error — the free
 // tier quota being exhausted is a transient infrastructure limit, not a fault
 // in the pipeline. All other non-200 responses are returned as errors.
-func (d *HackerTargetDiscoverer) Discover(domain string) ([]models.Subdomain, error) {
+func (d *HackerTargetDiscoverer) Discover(ctx context.Context, domain string) ([]models.Subdomain, error) {
 	endpoint := hackertargetBase + "?q=" + url.QueryEscape(domain)
 
-	resp, err := d.client.Get(endpoint)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("hackertarget_discoverer: build request: %w", err)
+	}
+	resp, err := d.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("hackertarget_discoverer: request failed: %w", err)
 	}
@@ -72,7 +81,6 @@ func (d *HackerTargetDiscoverer) Discover(domain string) ([]models.Subdomain, er
 	}
 
 	target := strings.ToLower(strings.TrimSpace(domain))
-	seen := make(map[string]struct{})
 	var result []models.Subdomain
 
 	scanner := bufio.NewScanner(resp.Body)
@@ -88,14 +96,10 @@ func (d *HackerTargetDiscoverer) Discover(domain string) ([]models.Subdomain, er
 		if name == "" || !inScope(name, target) {
 			continue
 		}
-		if _, ok := seen[name]; ok {
-			continue
-		}
-		seen[name] = struct{}{}
 		result = append(result, models.Subdomain{Name: name, Source: hackertargetSource})
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("hackertarget_discoverer: scan body: %w", err)
 	}
-	return result, nil
+	return deduplicateSubdomains(result), nil
 }

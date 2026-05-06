@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -16,7 +17,7 @@ type stubDiscoverer struct {
 	err        error
 }
 
-func (s *stubDiscoverer) Discover(_ string) ([]models.Subdomain, error) {
+func (s *stubDiscoverer) Discover(_ context.Context, _ string) ([]models.Subdomain, error) {
 	return s.subdomains, s.err
 }
 
@@ -104,7 +105,7 @@ func TestMultiSourceDiscoverer_Discover(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			m := NewMultiSourceDiscoverer(tt.sources...)
-			got, err := m.Discover("example.com")
+			got, err := m.Discover(context.Background(), "example.com")
 
 			if tt.wantErr {
 				if err == nil {

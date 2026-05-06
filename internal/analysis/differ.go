@@ -25,8 +25,12 @@ import (
 
 // HistoryReader is the read-only subset of storage.Store required by Differ.
 //
-// Narrowing the dependency to just the two query methods means test mocks
-// only need to implement two functions — not the full Store interface.
+// Narrowing the dependency to just these three methods means test mocks only
+// need to implement three functions — not the full Store interface:
+//   - FindPorts
+//   - FindServices
+//   - FindAssets
+//
 // storage.PostgresStore satisfies this interface automatically because it
 // implements all Store methods, which includes these three.
 type HistoryReader interface {

@@ -11,11 +11,12 @@
 // can store both kinds of findings without either package knowing about the other.
 //
 // Why does this package define its own HeadClient interface instead of reusing
-// discovery.HTTPClient? discovery.HTTPClient exposes only Get. Bucket probing
-// only needs Head — using GET would download bucket index pages for every probe.
-// Adding Head to discovery.HTTPClient would force every discoverer to depend on
-// a method it never calls, violating Interface Segregation. The two interfaces
-// remain narrow and independent.
+// discovery.HTTPClient? Both interfaces expose Do, but the contracts differ:
+// discovery.HTTPClient is used exclusively for GET requests by OSINT sources,
+// while HeadClient is used exclusively for HEAD requests to probe bucket URLs.
+// Sharing a single interface would conflate two different semantic roles.
+// Keeping them separate means each package states its intent clearly and test
+// mocks only need to verify the call pattern they actually exercise.
 package cloudscan
 
 import (

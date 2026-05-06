@@ -1,6 +1,7 @@
 package scanner
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strconv"
@@ -68,6 +69,10 @@ func NewTCPScanner(ports []int, timeout time.Duration, workers, rateLimit int) *
 // Scan probes every (IP, port) combination in asset and returns one Port value
 // for each combination that accepted a TCP connection.
 //
+// ctx allows the pipeline to interrupt scanning early — workers check
+// ctx.Done() before each dial attempt so cancellation takes effect within one
+// ScanTimeout interval rather than after all jobs have been processed.
+//
 // Work is distributed across s.workers goroutines via a buffered job channel.
 // A successful net.DialTimeout confirms a port is open — the connection is
 // closed immediately because we only need reachability here. Banner reading is
@@ -75,7 +80,7 @@ func NewTCPScanner(ports []int, timeout time.Duration, workers, rateLimit int) *
 //
 // Results arrive in non-deterministic order because goroutines finish
 // independently. Callers must sort if a stable display order is required.
-func (s *TCPScanner) Scan(asset models.Asset) ([]models.Port, error) {
+func (s *TCPScanner) Scan(ctx context.Context, asset models.Asset) ([]models.Port, error) {
 	if !asset.IsValid() {
 		return nil, fmt.Errorf("tcp_scanner: invalid asset %q", asset.Domain)
 	}
@@ -122,6 +127,14 @@ func (s *TCPScanner) Scan(asset models.Asset) ([]models.Port, error) {
 		go func() {
 			defer wg.Done()
 			for j := range jobs {
+				// Check for cancellation before each dial. This ensures the
+				// worker pool drains promptly on Ctrl+C or client disconnect
+				// rather than completing the full job queue.
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
 				if tokens != nil {
 					<-tokens
 				}

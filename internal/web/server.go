@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -52,6 +53,10 @@ func Serve(ctx context.Context, addr string) error {
 		// header phase needs a deadline. WriteTimeout is omitted intentionally —
 		// setting it would cut off streaming responses mid-scan.
 		ReadHeaderTimeout: 10 * time.Second,
+		// Explicit cap on request header size; the default is also 1 MiB but
+		// naming it here makes the constraint visible and prevents silent
+		// dependency on an undocumented default.
+		MaxHeaderBytes: 1 << 20,
 	}
 
 	// Shut down gracefully when the parent context is cancelled.
@@ -72,9 +77,12 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	// Prevent MIME-sniffing and deny framing — standard defence-in-depth for HTML endpoints.
+	// Defence-in-depth headers: prevent MIME-sniffing, deny framing, and
+	// restrict resource loading to same-origin. The embedded HTML has no
+	// external dependencies so 'self' is the correct CSP scope.
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Content-Security-Policy", "default-src 'self'")
 	if _, err := w.Write(indexHTML); err != nil {
 		// The client disconnected before the full page was delivered.
 		// Nothing meaningful can be sent in response — log and return.
@@ -106,18 +114,44 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Acquire a scan slot before doing any further work. The non-blocking select
+	// means callers are rejected immediately rather than queued — under load the
+	// server stays responsive for new connections even while at capacity.
+	select {
+	case scanSemaphore <- struct{}{}:
+		defer func() { <-scanSemaphore }()
+	default:
+		writeSSEError(w, flusher, "server at capacity, try again shortly")
+		return
+	}
+
 	target := strings.TrimSpace(r.URL.Query().Get(queryParamTarget))
 	if target == "" {
 		writeSSEError(w, flusher, "target query parameter is required")
 		return
 	}
 
+	// Block direct scans of loopback, RFC 1918, and link-local addresses. These
+	// ranges should never be reachable from an external attack surface scanner;
+	// allowing them from the web UI would let any browser tab probe internal
+	// infrastructure (SSRF). Hostname targets pass through — the discovery layer
+	// scopes results to the declared target domain.
+	if isPrivateTarget(target) {
+		writeSSEError(w, flusher, "scanning private or reserved IP ranges is not permitted")
+		return
+	}
+
 	cfg := buildConfig(r, target)
 	runner, err := pipeline.NewRunner(cfg)
 	if err != nil {
-		// Log the full error server-side — it may include DSN credentials from the
-		// postgres driver. The client receives only a generic message.
-		log.Printf("web: handleScan: runner init: %v", err)
+		// Redact the DSN before logging — a postgres connection error includes the
+		// full DSN (with credentials) in its message. The client receives only a
+		// generic message to avoid leaking internal configuration.
+		logMsg := err.Error()
+		if cfg.DSN != "" {
+			logMsg = strings.ReplaceAll(logMsg, cfg.DSN, "[DSN redacted]")
+		}
+		log.Printf("web: handleScan: runner init: %v", logMsg)
 		writeSSEError(w, flusher, "Failed to initialise scanner. Check server logs.")
 		return
 	}
@@ -177,7 +211,40 @@ const (
 	// An unbounded value would allow a single browser tab to hold a scan goroutine
 	// open indefinitely. 30 seconds covers the slowest realistic banner grab.
 	maxScanTimeout = 30 * time.Second
+
+	// maxConcurrentScans limits the number of simultaneously active SSE scan
+	// connections. Each active scan spawns a full pipeline goroutine that makes
+	// outbound network requests and, when a DSN is provided, holds a database
+	// connection. Without a cap, a single attacker could exhaust file descriptors
+	// and memory by opening many browser tabs.
+	maxConcurrentScans = 50
 )
+
+// scanSemaphore is a buffered channel used as a counting semaphore. A handler
+// must acquire one slot before starting a scan and release it on return. When
+// the channel is full, the next request receives a capacity-error SSE event
+// instead of being queued — preventing memory growth under load.
+var scanSemaphore = make(chan struct{}, maxConcurrentScans)
+
+// isPrivateTarget reports whether target is a raw IP address that falls within
+// a private, loopback, or link-local range.
+//
+// Why only raw IPs and not hostnames?
+// Resolving a hostname inside the HTTP handler would require a DNS lookup before
+// the scan even starts, adding latency and a new failure mode. More importantly,
+// a hostname like "internal.corp" could resolve to a public IP on one network
+// and a private IP on another — validating the resolved IP instead of the name
+// would produce inconsistent behaviour depending on where the server runs.
+// Blocking raw private IPs catches the most direct SSRF vectors (e.g.
+// ?target=169.254.169.254) while leaving hostname targets to the discovery
+// layer, which already scopes results via inScope.
+func isPrivateTarget(target string) bool {
+	ip := net.ParseIP(target)
+	if ip == nil {
+		return false // hostname — not a raw IP, allow through
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
+}
 
 // buildConfig constructs a pipeline.Config from the HTTP request query params.
 // The target has already been validated non-empty by the caller.

@@ -1,6 +1,7 @@
 package scanner
 
 import (
+	"context"
 	"net"
 	"testing"
 	"time"
@@ -39,7 +40,7 @@ func TestTCPScanner_Scan_OpenPort(t *testing.T) {
 	s := NewTCPScanner([]int{port}, time.Second, 1, 0)
 	asset := models.Asset{Domain: "localhost", IPs: []string{"127.0.0.1"}}
 
-	got, err := s.Scan(asset)
+	got, err := s.Scan(context.Background(), asset)
 	if err != nil {
 		t.Fatalf("Scan() error = %v", err)
 	}
@@ -58,7 +59,7 @@ func TestTCPScanner_Scan_ClosedPort(t *testing.T) {
 	s := NewTCPScanner([]int{1}, 200*time.Millisecond, 1, 0)
 	asset := models.Asset{Domain: "localhost", IPs: []string{"127.0.0.1"}}
 
-	got, err := s.Scan(asset)
+	got, err := s.Scan(context.Background(), asset)
 	if err != nil {
 		t.Fatalf("Scan() unexpected error = %v", err)
 	}
@@ -69,7 +70,7 @@ func TestTCPScanner_Scan_ClosedPort(t *testing.T) {
 
 func TestTCPScanner_Scan_InvalidAsset(t *testing.T) {
 	s := NewTCPScanner([]int{80}, time.Second, 1, 0)
-	_, err := s.Scan(models.Asset{})
+	_, err := s.Scan(context.Background(), models.Asset{})
 	if err == nil {
 		t.Fatal("Scan() expected error for invalid asset, got nil")
 	}
@@ -84,7 +85,7 @@ func TestTCPScanner_Scan_MultiplePorts(t *testing.T) {
 	s := NewTCPScanner([]int{port1, port2}, time.Second, 10, 0)
 	asset := models.Asset{Domain: "localhost", IPs: []string{"127.0.0.1"}}
 
-	got, err := s.Scan(asset)
+	got, err := s.Scan(context.Background(), asset)
 	if err != nil {
 		t.Fatalf("Scan() error = %v", err)
 	}
@@ -110,7 +111,7 @@ func TestTCPScanner_Scan_MultipleIPs(t *testing.T) {
 		IPs:    []string{"127.0.0.1", "127.0.0.1"},
 	}
 
-	got, err := s.Scan(asset)
+	got, err := s.Scan(context.Background(), asset)
 	if err != nil {
 		t.Fatalf("Scan() error = %v", err)
 	}
@@ -143,7 +144,7 @@ func TestTCPScanner_Scan_WithRateLimit(t *testing.T) {
 	s := NewTCPScanner([]int{port}, time.Second, 1, 1000)
 	asset := models.Asset{Domain: "localhost", IPs: []string{"127.0.0.1"}}
 
-	got, err := s.Scan(asset)
+	got, err := s.Scan(context.Background(), asset)
 	if err != nil {
 		t.Fatalf("Scan() error = %v", err)
 	}
@@ -170,11 +171,41 @@ func TestTCPScanner_Scan_ZeroPorts(t *testing.T) {
 	s := NewTCPScanner([]int{}, time.Second, 1, 0)
 	asset := models.Asset{Domain: "localhost", IPs: []string{"127.0.0.1"}}
 
-	got, err := s.Scan(asset)
+	got, err := s.Scan(context.Background(), asset)
 	if err != nil {
 		t.Fatalf("Scan() with zero ports returned error %v, want nil", err)
 	}
 	if len(got) != 0 {
 		t.Errorf("Scan() with zero ports returned %d ports, want 0", len(got))
+	}
+}
+
+func TestTCPScanner_Scan_ContextCancelled(t *testing.T) {
+	// A pre-cancelled context must cause workers to exit via ctx.Done() before
+	// dialing. The scan returns quickly with an empty result — not an error,
+	// because partial/no results on cancellation is the correct domain behaviour.
+	ln, port := startAcceptServer(t)
+	defer ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel before Scan is called
+
+	s := NewTCPScanner([]int{port}, 2*time.Second, 10, 0)
+	asset := models.Asset{Domain: "localhost", IPs: []string{"127.0.0.1"}}
+
+	start := time.Now()
+	got, err := s.Scan(ctx, asset)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("Scan() with cancelled ctx returned error %v, want nil", err)
+	}
+	// Workers must drain via ctx.Done() well before the 2-second dial timeout.
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("Scan() took %v with cancelled ctx, want < 500ms", elapsed)
+	}
+	// A pre-cancelled context produces no results — no dial was attempted.
+	if len(got) != 0 {
+		t.Errorf("Scan() with cancelled ctx returned %d port(s), want 0", len(got))
 	}
 }

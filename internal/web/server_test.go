@@ -197,7 +197,9 @@ func TestHandleScan_ValidScan(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // simulate immediate cancellation / disconnect
 
-	req := httptest.NewRequest(http.MethodGet, "/scan?target=127.0.0.1", nil)
+	// "victim-service" has no dots → IsLocal=true (OSINT skipped, local pipeline).
+	// It is not a raw IP, so isPrivateTarget returns false — the SSRF guard passes.
+	req := httptest.NewRequest(http.MethodGet, "/scan?target=victim-service", nil)
 	req = req.WithContext(ctx)
 	rr := httptest.NewRecorder()
 
@@ -254,5 +256,64 @@ func TestHandleScan_MissingTarget(t *testing.T) {
 	}
 	if !strings.Contains(body, "target") {
 		t.Errorf("error payload does not mention 'target'; got:\n%s", body)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// isPrivateTarget
+// ---------------------------------------------------------------------------
+
+func TestIsPrivateTarget(t *testing.T) {
+	tests := []struct {
+		name   string
+		target string
+		want   bool
+	}{
+		// Loopback addresses must be blocked — they point back to the server itself.
+		{"IPv4 loopback", "127.0.0.1", true},
+		{"IPv6 loopback", "::1", true},
+
+		// RFC 1918 private ranges must be blocked — scanning them from the web UI
+		// is an SSRF vector targeting the server's internal network.
+		{"RFC 1918 class A", "10.0.0.1", true},
+		{"RFC 1918 class B", "172.16.0.1", true},
+		{"RFC 1918 class C", "192.168.1.1", true},
+
+		// AWS EC2 metadata endpoint — must be blocked.
+		{"link-local metadata", "169.254.169.254", true},
+
+		// Public IPs must be allowed through.
+		{"public IPv4", "93.184.216.34", false},
+		{"public IPv6", "2001:db8::1", false},
+
+		// Hostnames are not parsed as IPs; they pass through to the discovery layer.
+		{"hostname", "example.com", false},
+		{"localhost hostname", "localhost", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isPrivateTarget(tt.target); got != tt.want {
+				t.Errorf("isPrivateTarget(%q) = %v, want %v", tt.target, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHandleScan_PrivateIPRejected(t *testing.T) {
+	// The web handler must refuse scans targeting private IPs with an SSE error,
+	// not by scanning the address. This prevents SSRF attacks via the browser UI.
+	req := httptest.NewRequest(http.MethodGet, "/scan?target=127.0.0.1", nil)
+	rr := httptest.NewRecorder()
+	handleScan(rr, req)
+
+	body := rr.Body.String()
+	if rr.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 (SSE errors travel in the body)", rr.Code)
+	}
+	if !strings.Contains(body, "event: error") {
+		t.Errorf("response does not contain SSE error event for private IP; got:\n%s", body)
+	}
+	if !strings.Contains(body, "private") {
+		t.Errorf("error payload does not mention 'private'; got:\n%s", body)
 	}
 }

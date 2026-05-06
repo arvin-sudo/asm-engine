@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"context"
 	"errors"
 	"testing"
 )
@@ -225,7 +226,7 @@ func TestWayBackDiscoverer_Discover(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			d := NewWayBackDiscoverer(tt.client)
-			got, err := d.Discover("example.com")
+			got, err := d.Discover(context.Background(), "example.com")
 
 			if tt.wantErr {
 				if err == nil {

@@ -228,7 +228,7 @@ func (r *Runner) runPhase1(ctx context.Context, domain string, ch chan<- ScanEve
 		Message: fmt.Sprintf("Phase 1a: passive recon for %s (CT logs, HackerTarget, WayBack)...", domain),
 	}))
 
-	subdomains, err := r.subdiscoverer.Discover(domain)
+	subdomains, err := r.subdiscoverer.Discover(ctx, domain)
 	if err != nil {
 		emit(ch, newEvent(EventError, ErrorPayload{Phase: "1a", Message: err.Error()}))
 		return nil
@@ -437,7 +437,7 @@ func (r *Runner) runPhase2(ctx context.Context, cfg Config, liveAssets []models.
 			return
 		}
 
-		openPorts, err := r.tcpScanner.Scan(asset)
+		openPorts, err := r.tcpScanner.Scan(ctx, asset)
 		if err != nil {
 			emit(ch, newEvent(EventError, ErrorPayload{
 				Phase:   "2",

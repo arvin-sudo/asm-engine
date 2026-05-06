@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"testing"
@@ -106,7 +107,7 @@ func TestHackerTargetDiscoverer_Discover(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			d := NewHackerTargetDiscoverer(tt.client)
-			got, err := d.Discover("example.com")
+			got, err := d.Discover(context.Background(), "example.com")
 
 			if tt.wantErr {
 				if err == nil {

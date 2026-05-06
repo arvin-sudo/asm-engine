@@ -10,7 +10,11 @@
 // touching any of the discovery code.
 package scanner
 
-import "github.com/arvin-sudo/asm-engine/pkg/models"
+import (
+	"context"
+
+	"github.com/arvin-sudo/asm-engine/pkg/models"
+)
 
 // Scanner is the contract for any port-probing technique.
 //
@@ -25,8 +29,15 @@ type Scanner interface {
 	// Scan probes asset for open ports and returns one Port value for each
 	// port that accepted a connection.
 	//
+	// ctx allows the pipeline to interrupt a scan in progress — for example,
+	// when the user closes the browser tab or presses Ctrl+C. Workers check
+	// ctx.Done() before each dial attempt so cancellation takes effect within
+	// one dial interval (ScanTimeout) rather than waiting for the full scan
+	// to complete. Individual dial attempts are still bounded by ScanTimeout;
+	// ctx provides an outer bound for the phase as a whole.
+	//
 	// A closed or filtered port is not an error — it is an expected and normal
 	// outcome. An error is returned only when something prevented scanning
 	// from running at all, such as a local network failure or an invalid asset.
-	Scan(asset models.Asset) ([]models.Port, error)
+	Scan(ctx context.Context, asset models.Asset) ([]models.Port, error)
 }

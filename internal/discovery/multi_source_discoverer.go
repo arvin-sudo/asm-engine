@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
@@ -54,6 +55,11 @@ type sourceResult struct {
 // Discover queries every registered source concurrently and returns all unique
 // subdomains.
 //
+// ctx is forwarded to every source so that pipeline cancellation (Ctrl+C,
+// client disconnect) propagates into all in-flight HTTP requests simultaneously.
+// A goroutine whose source respects context cancellation exits promptly;
+// one that ignores it will still be bounded by the HTTP client timeout.
+//
 // Deduplication is by hostname: if "api.example.com" appears in both crt.sh
 // and HackerTarget, only the first occurrence (in original source order) is
 // kept and its Source tag reflects that source. This preserves accurate
@@ -63,7 +69,7 @@ type sourceResult struct {
 // If only some sources fail, the partial results from the successful sources
 // are returned with a nil error — the caller should not need to handle missing
 // sources from individual failed discoverers.
-func (m *MultiSourceDiscoverer) Discover(domain string) ([]models.Subdomain, error) {
+func (m *MultiSourceDiscoverer) Discover(ctx context.Context, domain string) ([]models.Subdomain, error) {
 	results := make([]sourceResult, len(m.sources))
 
 	var wg sync.WaitGroup
@@ -71,7 +77,7 @@ func (m *MultiSourceDiscoverer) Discover(domain string) ([]models.Subdomain, err
 		wg.Add(1)
 		go func(i int, src SubdomainDiscoverer) {
 			defer wg.Done()
-			found, err := src.Discover(domain)
+			found, err := src.Discover(ctx, domain)
 			results[i] = sourceResult{subdomains: found, err: err}
 		}(i, src)
 	}

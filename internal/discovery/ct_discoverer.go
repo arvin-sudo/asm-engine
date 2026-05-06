@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -73,17 +74,26 @@ type crtshEntry struct {
 //  2. Validate the HTTP status and stream-decode the JSON response body.
 //  3. Delegate parsing and deduplication to parseSubdomains.
 //
+// ctx is embedded in the outbound request via http.NewRequestWithContext so
+// that cancellation (Ctrl+C, client disconnect) propagates into the in-flight
+// connection. crt.sh can be slow under rate-limiting; without this the goroutine
+// would hang until the HTTP client's own timeout fires.
+//
 // Errors at each step are wrapped with a "ct_discoverer:" prefix so the caller
 // can immediately identify which layer of the pipeline failed without reading
 // through stack traces.
-func (d *CTDiscoverer) Discover(domain string) ([]models.Subdomain, error) {
+func (d *CTDiscoverer) Discover(ctx context.Context, domain string) ([]models.Subdomain, error) {
 	// The crt.sh wildcard operator is "%", which must be percent-encoded as
 	// "%25" in the query string so the HTTP client transmits it literally.
 	// url.QueryEscape handles this correctly and is far more readable than
 	// embedding the encoding directly in a format string.
 	endpoint := crtshBase + "?q=" + url.QueryEscape("%."+domain) + "&output=json"
 
-	resp, err := d.client.Get(endpoint)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("ct_discoverer: build request: %w", err)
+	}
+	resp, err := d.client.Do(req)
 	if err != nil {
 		// A network-level failure: DNS resolution of crt.sh failed, a proxy
 		// blocked the connection, or the request timed out before a response

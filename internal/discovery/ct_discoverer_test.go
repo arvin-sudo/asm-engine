@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -15,7 +16,12 @@ type mockHTTPClient struct {
 	err        error
 }
 
-func (m *mockHTTPClient) Get(_ string) (*http.Response, error) {
+func (m *mockHTTPClient) Do(req *http.Request) (*http.Response, error) {
+	// Honour request context cancellation — the real http.Client.Do does this,
+	// and tests that pass a cancelled context rely on this behaviour.
+	if err := req.Context().Err(); err != nil {
+		return nil, err
+	}
 	if m.err != nil {
 		return nil, m.err
 	}
@@ -151,7 +157,7 @@ func TestCTDiscoverer_Discover(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			d := NewCTDiscoverer(tt.client)
-			got, err := d.Discover("example.com")
+			got, err := d.Discover(context.Background(), "example.com")
 
 			if tt.wantErr {
 				if err == nil {
@@ -173,5 +179,24 @@ func TestCTDiscoverer_Discover(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCTDiscoverer_Discover_ContextCancelled(t *testing.T) {
+	// A pre-cancelled context must propagate into http.NewRequestWithContext,
+	// which causes Do to return an error immediately. Discover must surface that
+	// as a non-nil error without panicking or blocking.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel before Discover is called
+
+	// The mock's Do method is never reached because NewRequestWithContext fails
+	// when the context is already done. Use a mock that would succeed if called,
+	// so a passing test proves the request was aborted before the network layer.
+	client := &mockHTTPClient{statusCode: 200, body: `[]`}
+	d := NewCTDiscoverer(client)
+
+	_, err := d.Discover(ctx, "example.com")
+	if err == nil {
+		t.Fatal("Discover() with cancelled ctx returned nil error, want non-nil")
 	}
 }

@@ -14,7 +14,11 @@
 // without touching the DNS resolver in step 2, and vice versa.
 package discovery
 
-import "github.com/arvin-sudo/asm-engine/pkg/models"
+import (
+	"context"
+
+	"github.com/arvin-sudo/asm-engine/pkg/models"
+)
 
 // SubdomainDiscoverer is the contract for any passive recon technique that
 // finds hostnames associated with a target domain.
@@ -26,10 +30,16 @@ import "github.com/arvin-sudo/asm-engine/pkg/models"
 type SubdomainDiscoverer interface {
 	// Discover returns all hostnames for domain found by this implementation.
 	//
+	// ctx allows the pipeline to cancel an in-flight request — for example,
+	// when the user presses Ctrl+C or closes the browser tab. Implementations
+	// must build HTTP requests with http.NewRequestWithContext(ctx, ...) so the
+	// cancellation propagates into the underlying transport and the goroutine
+	// exits promptly instead of waiting for a slow external API to respond.
+	//
 	// An empty result set is not an error — it means the data source had no
 	// records for this domain. A non-nil error means the data source itself
 	// could not be reached or returned an unexpected response.
-	Discover(domain string) ([]models.Subdomain, error)
+	Discover(ctx context.Context, domain string) ([]models.Subdomain, error)
 }
 
 // Discoverer is the contract for resolving a discovered hostname to a full

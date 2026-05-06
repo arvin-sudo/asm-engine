@@ -24,7 +24,7 @@ type mockSubdomainDiscoverer struct {
 	err     error
 }
 
-func (m mockSubdomainDiscoverer) Discover(_ string) ([]models.Subdomain, error) {
+func (m mockSubdomainDiscoverer) Discover(_ context.Context, _ string) ([]models.Subdomain, error) {
 	return m.results, m.err
 }
 
@@ -42,7 +42,7 @@ type mockScanner struct {
 	err   error
 }
 
-func (m mockScanner) Scan(_ models.Asset) ([]models.Port, error) {
+func (m mockScanner) Scan(_ context.Context, _ models.Asset) ([]models.Port, error) {
 	return m.ports, m.err
 }
 
