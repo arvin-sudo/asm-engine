@@ -1,6 +1,7 @@
 package cloudscan
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
@@ -47,16 +48,20 @@ func NewBucketHunter(client HeadClient) *BucketHunter {
 	return &BucketHunter{client: client}
 }
 
-// Scan derives bucket name candidates from domain and probes each one on AWS S3
-// and Azure Blob Storage. It returns a BucketResult for every endpoint that
-// responds with 200 (publicly accessible) or 403 (exists but private).
-// 404 responses and network-level errors are silently skipped — one unreachable
-// candidate must not stop the rest of the sweep.
+// Scan derives bucket name candidates from domain and probes each one on AWS S3,
+// Azure Blob Storage, and GCP Cloud Storage. It returns a BucketResult for every
+// endpoint that responds with 200 (publicly accessible) or 403 (exists but
+// private). 404 responses and network-level errors are silently skipped — one
+// unreachable candidate must not stop the rest of the sweep.
+//
+// ctx is forwarded to every outbound HTTP request. A cancelled context causes
+// the loop to exit after the current in-flight request completes; it does not
+// abruptly kill an established connection.
 //
 // An empty domain returns immediately with no results. candidatesFromDomain("")
 // would otherwise generate candidates like "" and "-backup" that produce
 // malformed probe URLs rejected at the DNS or HTTP layer.
-func (h *BucketHunter) Scan(domain string) ([]models.BucketResult, error) {
+func (h *BucketHunter) Scan(ctx context.Context, domain string) ([]models.BucketResult, error) {
 	if domain == "" {
 		return nil, nil
 	}
@@ -65,11 +70,19 @@ func (h *BucketHunter) Scan(domain string) ([]models.BucketResult, error) {
 
 	var results []models.BucketResult
 	for _, entry := range urls {
-		resp, err := h.client.Head(entry.url)
+		if ctx.Err() != nil {
+			// Pipeline was cancelled — stop probing and return whatever we have.
+			return results, nil
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodHead, entry.url, nil)
 		if err != nil {
-			// Network-level failure: DNS error, connection refused, timeout.
-			// Skip — it does not prove the bucket is absent, only that this
-			// particular probe could not reach the endpoint right now.
+			continue
+		}
+		resp, err := h.client.Do(req)
+		if err != nil {
+			// Network-level failure: DNS error, connection refused, timeout,
+			// or context cancellation. Skip — it does not prove the bucket is
+			// absent, only that this particular probe could not reach the endpoint.
 			continue
 		}
 		resp.Body.Close()

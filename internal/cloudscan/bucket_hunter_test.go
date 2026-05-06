@@ -1,6 +1,7 @@
 package cloudscan
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -16,7 +17,8 @@ type mockHeadClient struct {
 	failURLs  map[string]bool // url → return error instead of response
 }
 
-func (m *mockHeadClient) Head(url string) (*http.Response, error) {
+func (m *mockHeadClient) Do(req *http.Request) (*http.Response, error) {
+	url := req.URL.String()
 	if m.failURLs != nil && m.failURLs[url] {
 		return nil, errors.New("mock network error")
 	}
@@ -146,7 +148,7 @@ func TestBucketHunter_Scan(t *testing.T) {
 			client := &mockHeadClient{responses: tt.responses, failURLs: tt.failURLs}
 			hunter := NewBucketHunter(client)
 
-			results, err := hunter.Scan(tt.domain)
+			results, err := hunter.Scan(context.Background(), tt.domain)
 			if err != nil {
 				t.Fatalf("Scan(%q) returned unexpected error: %v", tt.domain, err)
 			}
@@ -176,7 +178,7 @@ func TestBucketHunter_Scan_ResultFields(t *testing.T) {
 	}
 	hunter := NewBucketHunter(client)
 
-	results, err := hunter.Scan("example.com")
+	results, err := hunter.Scan(context.Background(), "example.com")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -199,6 +201,29 @@ func TestBucketHunter_Scan_ResultFields(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected result for URL %q not found in %v", targetURL, results)
+	}
+}
+
+// TestBucketHunter_Scan_CancelledContext verifies that Scan returns immediately
+// with no results when the context is already cancelled before the call. This
+// exercises the ctx.Err() guard at the top of each loop iteration.
+func TestBucketHunter_Scan_CancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel before Scan is called
+
+	client := &mockHeadClient{
+		responses: map[string]int{
+			"https://example.s3.amazonaws.com": http.StatusOK,
+		},
+	}
+	hunter := NewBucketHunter(client)
+
+	results, err := hunter.Scan(ctx, "example.com")
+	if err != nil {
+		t.Fatalf("Scan with cancelled ctx returned unexpected error: %v", err)
+	}
+	if len(results) != 0 {
+		t.Errorf("Scan with cancelled ctx: got %d result(s), want 0", len(results))
 	}
 }
 

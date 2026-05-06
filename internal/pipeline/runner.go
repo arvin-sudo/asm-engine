@@ -608,7 +608,7 @@ func (r *Runner) runPhase3(ctx context.Context, domain string, ch chan<- ScanEve
 		Message: fmt.Sprintf("Phase 3: cloud bucket scan for %s...", domain),
 	}))
 
-	buckets, err := r.cloudScanner.Scan(domain)
+	buckets, err := r.cloudScanner.Scan(ctx, domain)
 	if err != nil {
 		emit(ch, newEvent(EventError, ErrorPayload{Phase: "3", Message: fmt.Sprintf("cloud bucket scan failed: %v", err)}))
 		return

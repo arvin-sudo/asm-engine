@@ -19,6 +19,7 @@
 package cloudscan
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/arvin-sudo/asm-engine/pkg/models"
@@ -26,15 +27,14 @@ import (
 
 // HeadClient is the HTTP transport interface used by BucketHunter.
 //
-// Only Head is needed — bucket probing requires checking whether a URL responds,
-// not reading its contents. Defining a single-method interface rather than
-// accepting *http.Client directly keeps BucketHunter testable without real
-// network access. *http.Client satisfies HeadClient directly; its Head method
+// Do is used rather than Head so that callers can construct requests with
+// http.NewRequestWithContext and propagate cancellation signals through the
+// pipeline. *http.Client satisfies HeadClient directly — its Do method
 // signature matches with no adapter needed.
 type HeadClient interface {
-	// Head issues an HTTP HEAD request to url and returns the server's response.
+	// Do sends an HTTP request and returns the server's response.
 	// The caller is responsible for closing resp.Body when done with it.
-	Head(url string) (*http.Response, error)
+	Do(req *http.Request) (*http.Response, error)
 }
 
 // CloudScanner discovers publicly accessible or misconfigured cloud storage
@@ -44,6 +44,9 @@ type HeadClient interface {
 // each endpoint that exists (status 200 or 403). Endpoints that return 404 are
 // discarded — a 404 from a cloud provider means the bucket name is simply not
 // registered, which is the expected outcome for most candidates.
+//
+// ctx is forwarded to every outbound HTTP request so the pipeline's
+// cancellation signal can interrupt in-flight probes immediately.
 type CloudScanner interface {
-	Scan(domain string) ([]models.BucketResult, error)
+	Scan(ctx context.Context, domain string) ([]models.BucketResult, error)
 }

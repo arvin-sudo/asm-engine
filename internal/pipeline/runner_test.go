@@ -68,7 +68,7 @@ type mockCloudScanner struct {
 	err     error
 }
 
-func (m mockCloudScanner) Scan(_ string) ([]models.BucketResult, error) {
+func (m mockCloudScanner) Scan(_ context.Context, _ string) ([]models.BucketResult, error) {
 	return m.results, m.err
 }
 

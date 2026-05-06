@@ -23,6 +23,10 @@ services:
   db:
     image: postgres:16-alpine
     networks: [asm-net]
+    # Port 5432 is exposed to the host so integration tests and psql sessions
+    # can reach the database directly without going through the Docker network.
+    ports:
+      - "5432:5432"
     environment:
       POSTGRES_DB:       asmdb
       POSTGRES_USER:     asm

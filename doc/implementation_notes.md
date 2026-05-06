@@ -1604,3 +1604,87 @@ A three-agent deep audit of all 11 packages identified SOLID/DRY violations, mag
 `go vet ./...` — zero diagnostics.
 `go build ./...` — clean.
 `go build ./...` — clean.
+
+## Hardening Pass 3 (2026-05-06)
+
+A security audit of the unauthenticated web endpoint identified DoS vectors, a
+credential leakage path, and missing standard HTTP security headers.
+
+### Security Fixes — `internal/web/server.go`
+
+| Location | Fix |
+|---|---|
+| `buildConfig` | Clamped `workers` to 1–500 (`maxWorkers`). `?workers=0` previously stalled the TCP scanner pool; `?workers=1000000` would spawn uncapped goroutines from a single browser tab. |
+| `buildConfig` | Clamped `timeout` to ≤30 s (`maxScanTimeout`). Prevents a single request from holding a goroutine open indefinitely. |
+| `handleScan` | `pipeline.NewRunner` errors are now logged server-side; the client receives only `"Failed to initialise scanner. Check server logs."`. Previously the full error — which may include DSN credentials embedded by the postgres driver — was forwarded to the browser. |
+| SSE marshal loop | `json.Marshal` failure now logs to `stderr`. Previously the loop silently `continue`d, dropping events with no trace. |
+| `serveIndex` | Added `X-Content-Type-Options: nosniff` and `X-Frame-Options: DENY` response headers. Standard defence-in-depth for HTML endpoints: prevents MIME-sniffing attacks and denies framing of the dashboard. |
+
+### Dead Code Removed
+
+`filterByIP([]models.Asset, string) []models.Asset` in `cmd/asm/main.go` — defined but never called anywhere in the codebase. Removed along with its godoc comment and `TestFilterByIP` in `cmd/asm/main_test.go`. The now-unused `pkg/models` import in the test file was also removed.
+
+### Test Added
+
+| File | Test |
+|---|---|
+| `internal/discovery/scope_test.go` | `TestInScope` — 9 table-driven cases covering apex match, direct subdomain, nested subdomain, wildcard CT log entry, unrelated domain, prefix-similar domain (no-dot boundary), and empty input/target edge cases. This was the only file in the discovery package with no test coverage. |
+
+### Documentation
+
+`IsLocalTarget` godoc in `runner.go` extended with an explicit security note: the scanner probes whatever address the target resolves to by design; cloud or multi-tenant deployments need a reverse proxy with authentication in front of the `/scan` endpoint.
+
+### Verification
+
+`go test -race -count=1 ./...` — all 11 packages pass, zero race conditions.
+`go vet ./...` — zero diagnostics.
+`go build ./...` — clean.
+
+## Context Propagation & Storage Integration Tests (2026-05-06)
+
+### Context Propagation — `internal/cloudscan`
+
+`BucketHunter.Scan` previously ignored the pipeline `ctx`, so a cancelled scan
+could not interrupt in-flight cloud storage probes. Fixed across three files:
+
+| File | Change |
+|---|---|
+| `internal/cloudscan/cloudscan.go` | `HeadClient`: `Head(url string)` → `Do(req *http.Request)`. `*http.Client` satisfies `Do` natively — no adapter needed. `CloudScanner.Scan` now takes `ctx context.Context` as first argument. |
+| `internal/cloudscan/bucket_hunter.go` | `Scan` checks `ctx.Err()` before each URL probe and builds requests with `http.NewRequestWithContext`. A cancelled context exits the loop immediately and returns partial results. |
+| `internal/pipeline/runner.go` | `runPhase3` passes `ctx` to `cloudScanner.Scan(ctx, domain)`. |
+| `internal/cloudscan/bucket_hunter_test.go` | `mockHeadClient` updated from `Head` to `Do`; all `Scan` calls updated to pass `context.Background()`; new `TestBucketHunter_Scan_CancelledContext` added. |
+| `internal/pipeline/runner_test.go` | `mockCloudScanner.Scan` signature updated to match new interface. |
+
+### Storage Integration Tests — `internal/storage/postgres_store_test.go`
+
+`internal/storage` had no coverage visible to `go test ./...`. A `//go:build integration`
+file existed; 15 new tests were added. Run with:
+
+```
+TEST_DB="postgres://asm:asm_secret@localhost:5432/asmdb?sslmode=disable" \
+  go test -tags integration -v -race -count=1 ./internal/storage/...
+```
+
+| Category | Tests added |
+|---|---|
+| Security | `SQLInjection` — 4 payloads (DROP TABLE, OR 1=1, DELETE variants) across domain, IP, name, version, banner. All stored verbatim; schema intact. Confirms parameterized queries prevent injection. |
+| Edge cases | `EmptyIPs` (pq.StringArray `{}` round-trips as `[]string{}`), `ManyIPs` (50 IPs), `LongBanner` (8 KB — TEXT has no length limit), `EmptyFields` (schema DEFAULT '' applies), `UDPProto` (tcp + udp on same port number stored as distinct rows via composite PK), `VersionDowngrade` (ON CONFLICT DO UPDATE works in both directions) |
+| FK enforcement | `SavePort_WithoutAsset` → FK error; `SaveService_WithoutPort` → FK error; `SaveBucket_NoDomainAsset` → succeeds (bucket_results has no FK to assets by design) |
+| Concurrency | `Concurrent_SaveAsset` (20 goroutines, same domain — ON CONFLICT handles the race); `Concurrent_SavePort` (20 goroutines, distinct port numbers — all 20 rows written) |
+| Timestamps | `Timestamps_UTC` (TIMESTAMPTZ always round-trips as time.UTC); `Timestamps_FirstSeenBeforeLastSeen` (upsert logic guarantees LastSeen > FirstSeen after second save) |
+| Lifecycle | `DoubleClose` (second Close() does not panic; returns error silently) |
+
+All 24 integration tests pass with `-race`. No bugs found.
+
+### Docker Compose — `deploy/docker-compose.yaml`
+
+`db` service now exposes `ports: ["5432:5432"]` so integration tests and `psql`
+sessions can connect from the host. `asm-engine` continues to reach Postgres
+via the internal `db` hostname inside the Docker network — no change needed there.
+
+### Verification
+
+`go test -race -count=1 ./...` — all 11 packages pass; storage shows `[no test files]` without the integration tag (correct).
+`go test -tags integration -v -race -count=1 ./internal/storage/...` — 24/24 pass, zero races.
+`go vet ./...` — zero diagnostics.
+`go build ./...` — clean.
