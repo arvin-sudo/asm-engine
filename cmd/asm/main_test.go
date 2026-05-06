@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/arvin-sudo/asm-engine/internal/pipeline"
-	"github.com/arvin-sudo/asm-engine/pkg/models"
 )
 
 func TestRun_MissingTarget(t *testing.T) {
@@ -108,31 +107,6 @@ func TestParsePorts_Invalid(t *testing.T) {
 			_, err := parsePorts(tt.input)
 			if err == nil {
 				t.Errorf("parsePorts(%q) expected error, got nil", tt.input)
-			}
-		})
-	}
-}
-
-func TestFilterByIP(t *testing.T) {
-	ports := []models.Port{
-		{IP: "1.2.3.4", Number: 80, Proto: "tcp"},
-		{IP: "5.6.7.8", Number: 443, Proto: "tcp"},
-		{IP: "1.2.3.4", Number: 443, Proto: "tcp"},
-	}
-
-	tests := []struct {
-		ip        string
-		wantCount int
-	}{
-		{"1.2.3.4", 2},
-		{"5.6.7.8", 1},
-		{"9.9.9.9", 0},
-	}
-	for _, tt := range tests {
-		t.Run(tt.ip, func(t *testing.T) {
-			got := filterByIP(ports, tt.ip)
-			if len(got) != tt.wantCount {
-				t.Errorf("filterByIP(%q) returned %d ports, want %d", tt.ip, len(got), tt.wantCount)
 			}
 		})
 	}

@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -175,6 +176,61 @@ func TestServeIndex_NonRootPath(t *testing.T) {
 	if rr.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want %d", rr.Code, http.StatusNotFound)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// handleScan — missing target
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// handleScan — happy path
+// ---------------------------------------------------------------------------
+
+// TestHandleScan_ValidScan verifies that handleScan sets the correct SSE
+// headers and that pipeline events are forwarded to the response body.
+//
+// A pre-cancelled context keeps the test instant and network-free. The
+// execute() goroutine still emits the Phase 1 completion event (OSINT skipped
+// for local targets) before it checks ctx.Err() and exits — giving us a real,
+// pipeline-produced SSE event to assert on without running a full scan.
+func TestHandleScan_ValidScan(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // simulate immediate cancellation / disconnect
+
+	req := httptest.NewRequest(http.MethodGet, "/scan?target=127.0.0.1", nil)
+	req = req.WithContext(ctx)
+	rr := httptest.NewRecorder()
+
+	handleScan(rr, req)
+
+	// SSE content-type must be set before any body bytes are written.
+	if ct := rr.Header().Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want text/event-stream", ct)
+	}
+	// The pipeline always emits phase_complete for the OSINT-skip before the
+	// first ctx.Err() check; verify it reached the response body.
+	if body := rr.Body.String(); !strings.Contains(body, "event: "+string(pipeline.EventPhaseComplete)) {
+		t.Errorf("response body does not contain phase_complete event; got:\n%s", body)
+	}
+}
+
+// TestHandleScan_ClientDisconnect verifies that handleScan exits cleanly when
+// the client disconnects (context cancelled) before the scan completes.
+//
+// A pre-cancelled context simulates an immediate disconnect. The pipeline
+// goroutine must detect the cancellation and close the event channel so the
+// range loop in handleScan terminates without blocking or panicking.
+func TestHandleScan_ClientDisconnect(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // disconnect immediately
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/scan?target=127.0.0.1&"+queryParamPorts+"=19998&"+queryParamTimeout+"=50ms", nil)
+	req = req.WithContext(ctx)
+	rr := httptest.NewRecorder()
+
+	// The handler must return without blocking or panicking.
+	handleScan(rr, req)
 }
 
 // ---------------------------------------------------------------------------

@@ -303,6 +303,11 @@ func parseHTTPResponse(raw string) (string, http.Header, error) {
 // and a Set-Cookie name, only one Technology entry is returned. This prevents
 // the caller from receiving duplicate entries for the same technology matched
 // from different evidence sources.
+//
+// The three rule categories (headers, cookies, body) are delegated to
+// detectHeaderTechs, detectCookieTechs, and detectBodyTechs respectively.
+// Each receives the shared add callback so deduplication remains centralised
+// here without passing a map or slice pointer across the call boundary.
 func detectTechnologies(headers http.Header, body string) []models.Technology {
 	seen := make(map[string]struct{})
 	var result []models.Technology
@@ -322,7 +327,17 @@ func detectTechnologies(headers http.Header, body string) []models.Technology {
 		})
 	}
 
-	// --- Header rules ---
+	detectHeaderTechs(headers, add)
+	detectCookieTechs(headers, add)
+	detectBodyTechs(body, add)
+
+	return result
+}
+
+// detectHeaderTechs matches HTTP response headers against the headerRules table.
+// Presence-only rules (rule.value == "") treat the header value itself as the
+// technology name when no name is configured (e.g. generic X-Powered-By).
+func detectHeaderTechs(headers http.Header, add func(name, category, evidence string)) {
 	for _, rule := range headerRules {
 		vals := headers[rule.header]
 		if len(vals) == 0 {
@@ -342,8 +357,13 @@ func detectTechnologies(headers http.Header, body string) []models.Technology {
 			add(rule.name, rule.category, rule.header+": "+vals[0])
 		}
 	}
+}
 
-	// --- Cookie rules ---
+// detectCookieTechs checks Set-Cookie header values against the cookieRules
+// table. Frameworks and analytics tools often set recognisable cookie names
+// (e.g. PHPSESSID → PHP, _pk_id → Matomo) that reveal the underlying stack
+// without requiring any active probing.
+func detectCookieTechs(headers http.Header, add func(name, category, evidence string)) {
 	for _, setCookie := range headers["Set-Cookie"] {
 		namePart := setCookie
 		if idx := strings.IndexByte(setCookie, '='); idx >= 0 {
@@ -356,14 +376,16 @@ func detectTechnologies(headers http.Header, body string) []models.Technology {
 			}
 		}
 	}
+}
 
-	// --- Body rules ---
+// detectBodyTechs scans the lowercased response body against the bodyRules
+// table. Patterns include framework-generated HTML comments, meta generator
+// tags, and characteristic script paths that are stable across versions.
+func detectBodyTechs(body string, add func(name, category, evidence string)) {
 	lowerBody := strings.ToLower(body)
 	for _, rule := range bodyRules {
 		if strings.Contains(lowerBody, rule.pattern) {
 			add(rule.name, rule.category, "HTML: "+rule.pattern+" detected")
 		}
 	}
-
-	return result
 }

@@ -1560,4 +1560,47 @@ Three packages previously had zero test files. All new tests are table-driven, u
 
 `go test -race -count=1 ./...` — all packages pass, zero race conditions.
 `go vet ./...` — zero diagnostics.
+
+---
+
+## Hardening Pass 2 (2026-05-06)
+
+A three-agent deep audit of all 11 packages identified SOLID/DRY violations, magic strings, refactoring opportunities, and test gaps. No show-stopping runtime bugs were found; all changes are quality improvements.
+
+### SOLID / DRY Fixes
+
+**`pipeline.NormalizeDomain(string) string`** — Domain normalisation (TrimSpace + TrimRight(".") + ToLower) was duplicated verbatim in `cmd/asm/main.go` and `internal/web/server.go`. Extracting to a single exported function in `internal/pipeline/runner.go` gives both callers one source of truth. The three-step rationale (whitespace, FQDN dot, case folding) is now documented in the godoc of the new function rather than in inline comments inside two separate files.
+
+**`discovery.inScope(name, target string) bool`** — The subdomain scope filter (`name == target || strings.HasSuffix(name, "."+target)`) was copy-pasted identically in all three discoverers (CT log, HackerTarget, WayBackMachine). Extracted to `internal/discovery/scope.go` with a godoc comment explaining the multi-tenant certificate injection risk it prevents. All three discoverers now call `inScope`.
+
+### Named Constants
+
+- `pipeline.eventChannelBufferSize = 64` — replaces the hardcoded `make(chan ScanEvent, 64)` literal, making the buffer capacity searchable and self-documenting.
+- `cmd/asm.uiAddr = ":8080"` — replaces two occurrences of `":8080"` (user-facing message and `web.Serve` call) in `main.go` so they stay in sync.
+- `web.queryParam*` constants (`queryParamTarget`, `queryParamPorts`, `queryParamWorkers`, `queryParamTimeout`, `queryParamRateLimit`, `queryParamDB`) — replaces bare string literals in `buildConfig`; a typo in a param name now fails at compile time instead of silently falling back to the default value at runtime.
+- `writeSSEError` — was hardcoding `"error"` as the SSE event name. Now uses `pipeline.EventError` constant, consistent with the rest of the SSE emitter.
+
+### Refactors
+
+**`analysis.portKey` promoted to package level** — was declared as a local type inside `DiffAsset`, then reused twice within the same function (port diff and service diff). Promoted to a named package-level type with a godoc comment. The reuse is now explicit and the type is visible to tests.
+
+**`fingerprint.detectTechnologies` split into three helpers** — the 60-line function mixing header, cookie, and body rule loops was split into `detectHeaderTechs`, `detectCookieTechs`, and `detectBodyTechs`. Each receives the shared `add` deduplication callback so the deduplication map stays centralised in the coordinator. Each helper has its own godoc explaining the category-specific detection strategy.
+
+### Documentation
+
+- `pkg/models.Asset.IPs` — added invariant comment: "IPs contains no duplicates; DNSResolver deduplicates before returning; callers must not append without checking for existing entries."
+
+### Tests Added
+
+| File | Test |
+|---|---|
+| `internal/web/server_test.go` | `TestHandleScan_ValidScan` — verifies SSE headers + phase_complete event forwarded to response body; uses pre-cancelled context to avoid network calls. |
+| `internal/web/server_test.go` | `TestHandleScan_ClientDisconnect` — pre-cancelled context; verifies handler exits cleanly without blocking or panicking. |
+| `internal/analysis/differ_test.go` | `"version downgraded — still reported as VERSION CHANGE"` table case added to `TestDiffer_DiffAsset_ServiceVersionChange`; confirms both upgrade and downgrade directions trigger the diff. |
+
+### Verification
+
+`go test -race -count=1 ./...` — all 11 packages pass, zero race conditions.
+`go vet ./...` — zero diagnostics.
+`go build ./...` — clean.
 `go build ./...` — clean.

@@ -43,6 +43,15 @@ type HistoryReader interface {
 	FindAssets() ([]models.AssetRecord, error)
 }
 
+// portKey uniquely identifies a port within an asset across multiple IPs.
+// Used as a map key in DiffAsset to build port and service lookup sets
+// without allocating separate composite-key strings.
+type portKey struct {
+	ip     string
+	number int
+	proto  string
+}
+
 // Differ computes the difference between the current scan results and the last
 // known state stored in the database.
 type Differ struct {
@@ -124,13 +133,6 @@ func (d *Differ) DiffAssets(current []models.Asset) (*models.ScanDiff, error) {
 //   - A service present in both scans with a different non-empty version → ChangeVersionChange
 func (d *Differ) DiffAsset(domain string, history *models.AssetHistory, currentPorts []models.Port, currentServices []models.Service) *models.ScanDiff {
 	diff := &models.ScanDiff{Domain: domain}
-
-	// portKey uniquely identifies a port across IPs within one asset.
-	type portKey struct {
-		ip     string
-		number int
-		proto  string
-	}
 
 	histPortSet := make(map[portKey]struct{}, len(history.Ports))
 	for _, p := range history.Ports {

@@ -90,6 +90,13 @@ const (
 	ctLogTimeout        = 30 * time.Second
 	hackerTargetTimeout = 10 * time.Second
 	waybackTimeout      = 60 * time.Second
+
+	// eventChannelBufferSize is the capacity of the ScanEvent channel returned
+	// by Run. A buffer of 64 gives the pipeline goroutine enough headroom during
+	// the Phase 1b subdomain burst so it never blocks waiting for the consumer.
+	// If the buffer overflows under extreme load, events are dropped gracefully
+	// (progress updates, not findings) rather than stalling the scan goroutine.
+	eventChannelBufferSize = 64
 )
 
 // NewRunner constructs a Runner by wiring every concrete implementation.
@@ -142,7 +149,7 @@ func (r *Runner) Close() {
 // phases (1a–1d) are skipped and a synthetic Asset is built directly from the
 // target so that IP addresses and Docker service names work without modification.
 func (r *Runner) Run(ctx context.Context, cfg Config) <-chan ScanEvent {
-	ch := make(chan ScanEvent, 64)
+	ch := make(chan ScanEvent, eventChannelBufferSize)
 	go func() {
 		defer close(ch)
 		r.execute(ctx, cfg, ch)
@@ -658,6 +665,30 @@ func buildSyntheticAsset(target string) models.Asset {
 // An IP address (net.ParseIP succeeds) or a hostname without dots
 // (e.g. "victim-container") cannot have public CT log history.
 // Exported so cmd/asm/main.go can call it without re-implementing the logic.
+//
+// Security note: this function does not block private or link-local IP ranges
+// (RFC 1918, 169.254.x.x, ::1). The scanner probes whatever address the target
+// resolves to, which is the intended behaviour for authorised external recon.
+// When running the web UI in a cloud environment, place a reverse proxy with
+// authentication in front of the server to prevent unauthorised callers from
+// directing the scanner at internal infrastructure.
 func IsLocalTarget(target string) bool {
 	return net.ParseIP(target) != nil || !strings.Contains(target, ".")
+}
+
+// NormalizeDomain trims whitespace, removes a trailing dot, and lowercases the
+// result. Both the CLI (cmd/asm/main.go) and the web handler (internal/web)
+// call this once at the entry point so every downstream package receives a
+// consistent, well-formed domain string.
+//
+// Why three steps:
+//   - TrimSpace: shells and HTTP clients can inject leading/trailing whitespace.
+//   - TrimRight("."): FQDN notation ("example.com.") breaks the crt.sh scope
+//     filter — the query becomes "%.example.com." and the parser computes
+//     target = "example.com.", which never matches lowercase results like
+//     "api.example.com", silently returning zero subdomains.
+//   - ToLower: DNS names are case-insensitive (RFC 4343); normalising up front
+//     prevents duplicate entries from mixed-case SAN values in CT log records.
+func NormalizeDomain(target string) string {
+	return strings.ToLower(strings.TrimRight(strings.TrimSpace(target), "."))
 }

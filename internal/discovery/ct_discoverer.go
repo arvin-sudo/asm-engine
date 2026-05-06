@@ -171,12 +171,10 @@ func parseSubdomains(entries []crtshEntry, targetDomain, source string) []models
 				continue
 			}
 
-			// Discard SANs that are not part of the target scope. A SAN must
-			// either equal the target apex ("example.com") or be a direct
-			// subdomain of it ("api.example.com", "*.example.com"). Without
-			// this guard, a multi-tenant certificate that covers unrelated
-			// domains would inject those domains into our scan results.
-			if name != target && !strings.HasSuffix(name, "."+target) {
+			// Discard SANs outside the target scope — see inScope for the
+			// full rationale. A multi-tenant certificate covers unrelated
+			// domains; without this guard they would pollute the results.
+			if !inScope(name, target) {
 				continue
 			}
 

@@ -114,7 +114,7 @@ func parseWayBackRecords(records [][]string, targetDomain, source string) []mode
 		if name == "" {
 			continue
 		}
-		if name != target && !strings.HasSuffix(name, "."+target) {
+		if !inScope(name, target) {
 			continue
 		}
 		if _, ok := seen[name]; ok {

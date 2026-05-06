@@ -248,6 +248,21 @@ func TestDiffer_DiffAsset_ServiceVersionChange(t *testing.T) {
 			wantOld:     "1.18.0",
 			wantNew:     "1.24.0",
 		},
+		{
+			// A downgrade (newer → older version) is a security signal — something
+			// may have been rolled back due to instability or a misconfiguration.
+			// DiffAsset must report it as a VERSION CHANGE regardless of direction.
+			name: "version downgraded — still reported as VERSION CHANGE",
+			histServices: []models.Service{
+				{Port: port443, Name: "nginx", Version: "1.24.0"},
+			},
+			currServices: []models.Service{
+				{Port: port443, Name: "nginx", Version: "1.18.0"},
+			},
+			wantChanges: 1,
+			wantOld:     "1.24.0",
+			wantNew:     "1.18.0",
+		},
 	}
 
 	for _, tt := range tests {

@@ -8,6 +8,10 @@
 // The embedded static asset is compiled into the binary via //go:embed so the
 // final binary is self-contained: no separate web server, no static file
 // directory, no runtime file system dependencies.
+//
+// The /scan endpoint is unauthenticated by design — it is intended for
+// single-operator, local-network use. For multi-user or cloud deployments,
+// place a reverse proxy with authentication in front of this server.
 package web
 
 import (
@@ -68,6 +72,9 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// Prevent MIME-sniffing and deny framing — standard defence-in-depth for HTML endpoints.
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
 	if _, err := w.Write(indexHTML); err != nil {
 		// The client disconnected before the full page was delivered.
 		// Nothing meaningful can be sent in response — log and return.
@@ -99,7 +106,7 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	target := strings.TrimSpace(r.URL.Query().Get("target"))
+	target := strings.TrimSpace(r.URL.Query().Get(queryParamTarget))
 	if target == "" {
 		writeSSEError(w, flusher, "target query parameter is required")
 		return
@@ -108,7 +115,10 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 	cfg := buildConfig(r, target)
 	runner, err := pipeline.NewRunner(cfg)
 	if err != nil {
-		writeSSEError(w, flusher, err.Error())
+		// Log the full error server-side — it may include DSN credentials from the
+		// postgres driver. The client receives only a generic message.
+		log.Printf("web: handleScan: runner init: %v", err)
+		writeSSEError(w, flusher, "Failed to initialise scanner. Check server logs.")
 		return
 	}
 	defer runner.Close()
@@ -119,6 +129,10 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 	for e := range runner.Run(r.Context(), cfg) {
 		b, err := json.Marshal(e)
 		if err != nil {
+			// ScanEvent and all payload types are controlled structs with no
+			// un-marshalable fields — this branch is unreachable in practice, but
+			// logging it ensures we notice if a future payload type breaks the invariant.
+			log.Printf("web: handleScan: marshal event %s: %v", e.Type, err)
 			continue
 		}
 		// SSE wire format:
@@ -143,24 +157,61 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// Query parameter names for the /scan endpoint — kept as constants so a typo
+// in either the server or a future test is caught at compile time rather than
+// silently falling back to the default value at runtime.
+const (
+	queryParamTarget    = "target"
+	queryParamPorts     = "ports"
+	queryParamWorkers   = "workers"
+	queryParamTimeout   = "timeout"
+	queryParamRateLimit = "rate_limit"
+	queryParamDB        = "db"
+
+	// maxWorkers caps the goroutine pool size accepted from the web UI to prevent
+	// resource exhaustion. The web endpoint is network-accessible, so a hard cap
+	// is required. CLI users choose their own --workers value and bear the risk.
+	maxWorkers = 500
+
+	// maxScanTimeout caps the per-connection deadline accepted from the web UI.
+	// An unbounded value would allow a single browser tab to hold a scan goroutine
+	// open indefinitely. 30 seconds covers the slowest realistic banner grab.
+	maxScanTimeout = 30 * time.Second
+)
+
 // buildConfig constructs a pipeline.Config from the HTTP request query params.
 // The target has already been validated non-empty by the caller.
 // Optional parameters mirror the CLI flags with the same defaults.
+//
+// Worker count and scan timeout are clamped to safe bounds: zero workers would
+// stall the TCP scanner's goroutine pool, and an unbounded timeout could hold a
+// scan goroutine open indefinitely from any browser tab that can reach port 8080.
 func buildConfig(r *http.Request, target string) pipeline.Config {
-	ports := parsePorts(r.URL.Query().Get("ports"))
-	workers := parseInt(r.URL.Query().Get("workers"), 100)
-	timeout := parseDuration(r.URL.Query().Get("timeout"), 2*time.Second)
-	rateLimit := parseInt(r.URL.Query().Get("rate_limit"), 0)
-	dsn := r.URL.Query().Get("db")
+	domain := pipeline.NormalizeDomain(target)
+	ports := parsePorts(r.URL.Query().Get(queryParamPorts))
+	workers := parseInt(r.URL.Query().Get(queryParamWorkers), 100)
+	timeout := parseDuration(r.URL.Query().Get(queryParamTimeout), 2*time.Second)
+	rateLimit := parseInt(r.URL.Query().Get(queryParamRateLimit), 0)
+	dsn := r.URL.Query().Get(queryParamDB)
+
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > maxWorkers {
+		workers = maxWorkers
+	}
+	if timeout > maxScanTimeout {
+		timeout = maxScanTimeout
+	}
 
 	return pipeline.Config{
-		Domain:      strings.ToLower(strings.TrimRight(target, ".")),
+		Domain:      domain,
 		Ports:       ports,
 		Workers:     workers,
 		ScanTimeout: timeout,
 		RateLimit:   rateLimit,
 		DSN:         dsn,
-		IsLocal:     pipeline.IsLocalTarget(strings.ToLower(strings.TrimRight(target, "."))),
+		IsLocal:     pipeline.IsLocalTarget(domain),
 	}
 }
 
@@ -178,7 +229,7 @@ func writeSSEError(w http.ResponseWriter, flusher http.Flusher, msg string) {
 		Type:    pipeline.EventError,
 		Payload: payload,
 	})
-	fmt.Fprintf(w, "event: error\ndata: %s\n\n", b)
+	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", pipeline.EventError, b)
 	flusher.Flush()
 }
 

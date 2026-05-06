@@ -85,7 +85,7 @@ func (d *HackerTargetDiscoverer) Discover(domain string) ([]models.Subdomain, er
 			continue
 		}
 		name := strings.ToLower(strings.TrimSpace(strings.SplitN(line, ",", 2)[0]))
-		if name == "" || (name != target && !strings.HasSuffix(name, "."+target)) {
+		if name == "" || !inScope(name, target) {
 			continue
 		}
 		if _, ok := seen[name]; ok {

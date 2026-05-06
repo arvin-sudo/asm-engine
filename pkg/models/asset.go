@@ -65,6 +65,11 @@ type Asset struct {
 	// hostname can resolve to multiple addresses (load balancers, CDN anycast
 	// nodes), and each IP is an independent attack surface. Storing all of them
 	// ensures the scanner does not miss hosts that sit behind a round-robin DNS.
+	//
+	// Invariant: IPs contains no duplicates. The DNSResolver deduplicates before
+	// returning an Asset; callers must not append to IPs without checking for
+	// existing entries, as a duplicate IP causes the port scanner to scan the
+	// same host twice and produces duplicate findings.
 	IPs []string
 }
 

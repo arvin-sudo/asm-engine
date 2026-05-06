@@ -37,6 +37,11 @@ import (
 // run() creates its own FlagSet and would error on --ui; adding --ui there
 // would require making --target optional for that mode, breaking the
 // TestRun_MissingTarget assertion.
+// uiAddr is the listen address for the embedded web UI.
+// Defined as a constant so the user-facing message and the Serve call stay
+// in sync without duplication.
+const uiAddr = ":8080"
+
 func main() {
 	log.SetFlags(0)
 
@@ -44,8 +49,8 @@ func main() {
 		if a == "--ui" || a == "-ui" {
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 			defer stop()
-			fmt.Println("DASM by Arv — UI server on http://localhost:8080")
-			if err := web.Serve(ctx, ":8080"); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			fmt.Printf("DASM by Arv — UI server on http://localhost%s\n", uiAddr)
+			if err := web.Serve(ctx, uiAddr); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Fatal(err)
 			}
 			return
@@ -87,16 +92,9 @@ func run(ctx context.Context, w io.Writer, args []string) error {
 		return err
 	}
 
-	// Normalise the domain once at the entry point.
-	// • TrimSpace removes accidental whitespace around the flag value.
-	// • TrimRight removes a trailing dot (FQDN notation: "example.com.").
-	//   Without this, the crt.sh query becomes "%.example.com." and the scope
-	//   filter in parseSubdomains computes target = "example.com.", which never
-	//   matches lowercased results like "api.example.com" — silently returning
-	//   zero subdomains for any target written in FQDN form.
-	// • ToLower avoids case mismatches in the scope filter and bucket-name
-	//   candidates; DNS and crt.sh are both case-insensitive.
-	domain := strings.ToLower(strings.TrimRight(strings.TrimSpace(*target), "."))
+	// Normalise once at the entry point; see pipeline.NormalizeDomain for the
+	// detailed rationale behind each transformation.
+	domain := pipeline.NormalizeDomain(*target)
 	if domain == "" {
 		return fmt.Errorf("--target is required. Example: asm-engine --target example.com")
 	}
@@ -273,14 +271,3 @@ func parsePorts(s string) ([]int, error) {
 	return ports, nil
 }
 
-// filterByIP returns the subset of ports that belong to a specific IP address.
-// Used to group scan results per IP when an asset resolves to multiple addresses.
-func filterByIP(ports []models.Port, ip string) []models.Port {
-	var result []models.Port
-	for _, p := range ports {
-		if p.IP == ip {
-			result = append(result, p)
-		}
-	}
-	return result
-}
