@@ -82,7 +82,7 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 	// external dependencies so 'self' is the correct CSP scope.
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
-	w.Header().Set("Content-Security-Policy", "default-src 'self'")
+	w.Header().Set("Content-Security-Policy", "default-src 'self' 'unsafe-inline'")
 	if _, err := w.Write(indexHTML); err != nil {
 		// The client disconnected before the full page was delivered.
 		// Nothing meaningful can be sent in response — log and return.

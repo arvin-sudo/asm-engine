@@ -48,7 +48,9 @@ A change in one module never breaks another.
 - [x] Differential analysis — detect new assets, opened/closed ports, version changes across scans
 - [x] Vulnerability mapping — built-in CVE dataset, zero-latency local check
 - [x] Technology stack fingerprinting — CMS/framework detection on HTTP/HTTPS ports
-- [ ] Phase 5: Go vs Python performance benchmarking
+- [x] Web UI dashboard — SSE streaming, live result cards, `//go:embed` single-file SPA
+- [x] Docker sandbox — multi-stage Dockerfile, three-service compose (db + victim-service + asm-engine)
+- _(Phase 5: Go vs Python benchmarking — replaced by Web UI + Docker sandbox deliverables)_
 
 ## License
 

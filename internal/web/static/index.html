@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>DASM by Arv</title>
+  <title>ASM-Engine by Arv</title>
   <style>
     :root {
       --bg:      #0d1117;
@@ -101,6 +101,7 @@
     .progress-panel {
       flex: 0 0 240px;
       min-height: 660px;
+      max-height: none;
     }
 
     .grid {
@@ -122,8 +123,9 @@
       overflow: hidden;
       display: flex;
       flex-direction: column;
-      min-height: 320px;
+      height: 380px;
     }
+    .card.progress-panel { height: auto; max-height: none; }
     .card-header {
       padding: .65rem 1rem;
       border-bottom: 1px solid var(--border);
@@ -259,8 +261,8 @@
 
 <!-- ── Header ──────────────────────────────────────────────────── -->
 <div class="header">
-  <h1>DASM <span>by Arv</span></h1>
-  <p>defensive attack surface mapping</p>
+  <h1>ASM-Engine <span>by Arv</span></h1>
+  <p>automated external attack surface mapping</p>
 </div>
 
 <!-- ── Search bar ──────────────────────────────────────────────── -->

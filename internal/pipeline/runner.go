@@ -184,6 +184,14 @@ func (r *Runner) execute(ctx context.Context, cfg Config, ch chan<- ScanEvent) {
 		// a bare hostname via the OS DNS (which works inside Docker bridge networks).
 		synth := buildSyntheticAsset(domain)
 		liveAssets = []models.Asset{synth}
+		if r.store != nil {
+			if err := r.store.SaveAsset(synth); err != nil {
+				emit(ch, newEvent(EventError, ErrorPayload{
+					Phase:   "1",
+					Message: fmt.Sprintf("save asset %q: %v", synth.Domain, err),
+				}))
+			}
+		}
 		emit(ch, newEvent(EventPhaseComplete, PhasePayload{
 			Phase:   "1a-1d",
 			Message: fmt.Sprintf("OSINT phases skipped — local target detected (%s).", domain),
@@ -236,7 +244,7 @@ func (r *Runner) runPhase1(ctx context.Context, domain string, ch chan<- ScanEve
 
 	emit(ch, newEvent(EventPhaseComplete, PhasePayload{
 		Phase:   "1a",
-		Message: fmt.Sprintf("Found %d subdomains.", len(subdomains)),
+		Message: fmt.Sprintf("Found %d %s.", len(subdomains), pluralise(len(subdomains), "subdomain", "subdomains")),
 	}))
 
 	if ctx.Err() != nil {
@@ -691,4 +699,12 @@ func IsLocalTarget(target string) bool {
 //     prevents duplicate entries from mixed-case SAN values in CT log records.
 func NormalizeDomain(target string) string {
 	return strings.ToLower(strings.TrimRight(strings.TrimSpace(target), "."))
+}
+
+// pluralise returns singular when n == 1, plural otherwise.
+func pluralise(n int, singular, plural string) string {
+	if n == 1 {
+		return singular
+	}
+	return plural
 }
