@@ -30,7 +30,8 @@ services:
     environment:
       POSTGRES_DB:       asmdb
       POSTGRES_USER:     asm
-      POSTGRES_PASSWORD: asm_secret
+      # Set POSTGRES_PASSWORD in a root-level .env file (see .env.example).
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       # init.sql runs once on first container start (before asm-engine connects).
       - ./db:/docker-entrypoint-initdb.d:ro
@@ -69,7 +70,8 @@ services:
       # This env var makes the DSN available inside the container so you can
       # pass it when overriding CMD for a one-shot CLI run:
       #   docker compose run asm-engine --target victim-service --db "$ASM_DB_DSN"
-      ASM_DB_DSN: "postgres://asm:asm_secret@db/asmdb?sslmode=disable"
+      # Set ASM_DB_DSN in a root-level .env file (see .env.example).
+      ASM_DB_DSN: ${ASM_DB_DSN}
     depends_on:
       db:
         condition: service_healthy
