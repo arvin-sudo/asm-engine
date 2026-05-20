@@ -36,21 +36,6 @@ make test
 Each internal module depends only on `/pkg/models` and its own interfaces.
 A change in one module never breaks another.
 
-## Roadmap
-
-- [x] Phase 1a: CT log subdomain discovery (crt.sh, HackerTarget, WayBack Machine) — concurrent fan-out
-- [x] Phase 1b: DNS resolution of discovered subdomains
-- [x] Phase 1c: PTR reverse DNS enrichment from live IPs
-- [x] Phase 1d: DNS intelligence — TXT/MX third-party service indicators (SPF, email providers)
-- [x] Phase 2: TCP port scanning + service fingerprinting (goroutine worker pool)
-- [x] Phase 3: Cloud bucket hunting (AWS S3, Azure Blob, GCP Cloud Storage)
-- [x] Phase 4: PostgreSQL persistence with FirstSeen/LastSeen change tracking
-- [x] Differential analysis — detect new assets, opened/closed ports, version changes across scans
-- [x] Vulnerability mapping — built-in CVE dataset, zero-latency local check
-- [x] Technology stack fingerprinting — CMS/framework detection on HTTP/HTTPS ports
-- [x] Web UI dashboard — SSE streaming, live result cards, `//go:embed` single-file SPA
-- [x] Docker sandbox — multi-stage Dockerfile, three-service compose (db + victim-service + asm-engine)
-- _(Phase 5: Go vs Python benchmarking — replaced by Web UI + Docker sandbox deliverables)_
 
 ## License
 
